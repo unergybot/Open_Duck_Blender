@@ -27,6 +27,7 @@ _NATIVE_KEYS = frozenset(
         "source_hashes_json",
     }
 )
+_QUATERNION_NORM_TOLERANCE = 1e-6
 
 
 @dataclass(frozen=True)
@@ -148,6 +149,12 @@ def load_motion(path: str | Path, profile: RobotProfile) -> ImportedMotion:
     if zeroes.size:
         frame, body = (int(value) for value in zeroes[0])
         raise MotionError(f"body_quat_w has a zero quaternion at frame {frame}, index {body}")
+    nonunit = np.argwhere(np.abs(norms - 1.0) > _QUATERNION_NORM_TOLERANCE)
+    if nonunit.size:
+        frame, body = (int(value) for value in nonunit[0])
+        raise MotionError(
+            f"body_quat_w at frame {frame}, index {body} must have a unit quaternion"
+        )
     root_quaternions = quaternions[:, 0] / norms[:, 0, None]
     for frame in range(1, frames):
         if float(np.dot(root_quaternions[frame - 1], root_quaternions[frame])) < 0:
@@ -184,8 +191,9 @@ def import_motion_action(armature, profile: RobotProfile, path: str | Path, *, a
     )
 
     scene = bpy.context.scene
-    animation_data = armature.animation_data_create()
-    previous_action = animation_data.action
+    animation_data = armature.animation_data
+    had_animation_data = animation_data is not None
+    previous_action = animation_data.action if animation_data is not None else None
     previous_matrix = armature.matrix_world.copy()
     previous_rotation_mode = armature.rotation_mode
     previous_pose = {
@@ -194,6 +202,8 @@ def import_motion_action(armature, profile: RobotProfile, path: str | Path, *, a
     previous_scene = (scene.frame_start, scene.frame_end, scene.frame_current, scene.render.fps)
     action = None
     try:
+        if animation_data is None:
+            animation_data = armature.animation_data_create()
         action = bpy.data.actions.new(action_name)
         action.use_fake_user = True
         animation_data.action = action
@@ -222,7 +232,10 @@ def import_motion_action(armature, profile: RobotProfile, path: str | Path, *, a
         scene.frame_set(scene.frame_start)
         return action
     except Exception as exc:
-        animation_data.action = previous_action
+        if had_animation_data:
+            animation_data.action = previous_action
+        elif armature.animation_data is not None:
+            armature.animation_data_clear()
         armature.matrix_world = previous_matrix
         armature.rotation_mode = previous_rotation_mode
         for bone in joint_bones:

@@ -109,12 +109,18 @@ class MotionLoaderTests(unittest.TestCase):
         names = archive_payload(profile)
         names["joint_names"] = np.array(["wrong", "knee"])
         cases.append((names, r"joint_names.*index 0.*wrong.*hip"))
+        body_names = archive_payload(profile)
+        body_names["body_names"] = np.array(["root", "wrong", "knee_link"])
+        cases.append((body_names, r"body_names.*index 1.*wrong.*hip_link"))
         nonfinite = archive_payload(profile)
         nonfinite["body_pos_w"][1, 2, 0] = np.nan
         cases.append((nonfinite, r"body_pos_w.*frame 1.*index 2"))
         zero = archive_payload(profile)
         zero["body_quat_w"][2, 0] = 0
         cases.append((zero, r"body_quat_w.*frame 2.*index 0"))
+        nonunit = archive_payload(profile)
+        nonunit["body_quat_w"][1, 2] = (2.0, 0.0, 0.0, 0.0)
+        cases.append((nonunit, r"body_quat_w.*frame 1.*index 2.*unit"))
         over_limit = archive_payload(profile)
         over_limit["joint_pos"][1, 1] = 0.75
         cases.append((over_limit, r"joint_pos.*frame 1.*index 1.*knee"))
@@ -226,3 +232,40 @@ class MotionActionTests(unittest.TestCase):
         assert_quaternion_close(self, self.armature.rotation_quaternion, (0.5, 0.5, 0.5, 0.5))
         self.assertAlmostEqual(pose_bone.rotation_euler.z, 0.2, places=6)
         self.assertIsNone(bpy.data.actions.get("Broken"))
+
+    def test_removes_new_animation_data_when_keying_fails_without_prior_animation(self):
+        self.assertIsNone(self.armature.animation_data)
+        pose_bone = self.armature.pose.bones["hip_link"]
+        with tempfile.TemporaryDirectory() as directory:
+            path = MotionLoaderTests().write_archive(Path(directory), action_payload(self.profile))
+            with mock.patch.object(type(pose_bone), "keyframe_insert", side_effect=RuntimeError("injected")):
+                with self.assertRaisesRegex(MotionError, "injected"):
+                    import_motion_action(self.armature, self.profile, path, action_name="NoAnimation")
+
+        self.assertIsNone(self.armature.animation_data)
+        self.assertIsNone(bpy.data.actions.get("NoAnimation"))
+
+    def test_translates_animation_data_creation_failure_without_mutation(self):
+        class FailingAnimationCreateArmature:
+            def __init__(self, armature):
+                self._armature = armature
+
+            def __getattr__(self, name):
+                return getattr(self._armature, name)
+
+            def animation_data_create(self):
+                raise RuntimeError("create injected")
+
+        self.assertIsNone(self.armature.animation_data)
+        with tempfile.TemporaryDirectory() as directory:
+            path = MotionLoaderTests().write_archive(Path(directory), action_payload(self.profile))
+            with self.assertRaisesRegex(MotionError, "create injected"):
+                import_motion_action(
+                    FailingAnimationCreateArmature(self.armature),
+                    self.profile,
+                    path,
+                    action_name="CreateFailure",
+                )
+
+        self.assertIsNone(self.armature.animation_data)
+        self.assertIsNone(bpy.data.actions.get("CreateFailure"))
