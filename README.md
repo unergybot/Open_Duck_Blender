@@ -192,7 +192,7 @@ uv run scripts/export_policy_rollout.py \
   ~/MyCode/microduck/policies/alpha_walking.onnx \
   --output /tmp/alpha-walking-forward.npz \
   --duration 4 \
-  --lin-vel-x 0.15 \
+  --lin-vel-x 0.30 \
   --seed 0
 uv run scripts/validate_blender_motion.py /tmp/alpha-walking-forward.npz
 ```
@@ -206,6 +206,17 @@ and sets the scene to the archive frame range at 50 Hz. Importing never changes
 `duck_mouth_open`: the articulated mouth is visual-only and excluded from the
 14-joint policy archive. Use **Open Duck → Export mjlab Motion** to export the
 active imported action again.
+
+### Policy walking milestone
+
+`microduck-alpha.blend` ships with `Policy_alpha_walking_forward`, a
+deterministic 200-frame, 50 Hz action generated from `alpha_walking.onnx` with
+the forward command set to `0.30 m/s`. The action preserves simulated root
+motion and advances approximately `0.162 m` over four seconds.
+
+| Frame 1 | Frame 100 | Frame 200 |
+| --- | --- | --- |
+| ![Microduck policy walk at frame 1](assets/previews/microduck-policy-walk-start.png) | ![Microduck policy walk at frame 100](assets/previews/microduck-policy-walk-mid.png) | ![Microduck policy walk at frame 200](assets/previews/microduck-policy-walk-end.png) |
 
 `microduck-alpha.blend` includes a 51-frame neutral-to-crouch-to-neutral test
 action. Its verified export is stored at
