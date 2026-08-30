@@ -266,7 +266,13 @@ def _create_demo_action(armature, profile, motion_path: Path) -> None:
         raise
     except (KeyError, OSError, ValueError) as exc:
         raise ProfileError(f"demo motion could not be loaded: {exc}") from exc
-    if fps.shape != (1,) or int(fps[0]) != 50:
+    if fps.shape != (1,):
+        raise ProfileError("demo motion must declare fps=[50]")
+    try:
+        fps_value = float(fps[0])
+    except (TypeError, ValueError) as exc:
+        raise ProfileError("demo motion must declare fps=[50]") from exc
+    if not np.isfinite(fps_value) or fps_value != 50.0:
         raise ProfileError("demo motion must declare fps=[50]")
     if joint_names != tuple(profile.joint_names):
         raise ProfileError("demo motion joint_names do not match the robot profile")

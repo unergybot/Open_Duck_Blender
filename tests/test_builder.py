@@ -202,6 +202,26 @@ class SceneBuilderTests(unittest.TestCase):
                     "joint_names": np.array(["hinge"]),
                     "joint_pos": np.array(0.0),
                 },
+                {
+                    "fps": np.array([50.9]),
+                    "joint_names": np.array(["hinge"]),
+                    "joint_pos": np.array([[0.0]]),
+                },
+                {
+                    "fps": np.array(["bad"]),
+                    "joint_names": np.array(["hinge"]),
+                    "joint_pos": np.array([[0.0]]),
+                },
+                {
+                    "fps": np.array([np.nan]),
+                    "joint_names": np.array(["hinge"]),
+                    "joint_pos": np.array([[0.0]]),
+                },
+                {
+                    "fps": np.array([np.inf]),
+                    "joint_names": np.array(["hinge"]),
+                    "joint_pos": np.array([[0.0]]),
+                },
             )
             for index, payload in enumerate(malformed):
                 motion = root / f"malformed-{index}.npz"
