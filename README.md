@@ -168,3 +168,8 @@ uv run scripts/validate_blender_motion.py /path/to/motion.npz
 
 The validator checks the schema, exact joint/body ordering, 50 Hz metadata,
 finite arrays, and replays every frame through the canonical MuJoCo model.
+
+`microduck-alpha.blend` includes a 51-frame neutral-to-crouch-to-neutral test
+action. Its verified export is stored at
+`assets/motions/microduck-crouch-test.npz`; the animated mouth is visual-only
+and remains outside the 14-joint policy archive.

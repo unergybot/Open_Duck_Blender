@@ -20,13 +20,26 @@ def _twist_angle(quaternion: Quaternion, axis: tuple[float, float, float]) -> fl
     return (angle + math.pi) % (2.0 * math.pi) - math.pi
 
 
-def joint_angles_from_body_matrices(matrices, profile) -> tuple[float, ...]:
+def joint_angles_from_body_matrices(
+    matrices, profile, rest_matrices=None
+) -> tuple[float, ...]:
     bodies = {body.name: body for body in profile.bodies}
     result = []
     for joint in profile.joints:
         relative = matrices[joint.parent_body].inverted_safe() @ matrices[joint.child_body]
-        dynamic = _rest_matrix(bodies[joint.child_body]).inverted_safe() @ relative
-        result.append(_twist_angle(dynamic.to_quaternion(), joint.axis))
+        if rest_matrices is None:
+            rest_relative = _rest_matrix(bodies[joint.child_body])
+            axis = joint.axis
+        else:
+            rest_relative = (
+                rest_matrices[joint.parent_body].inverted_safe()
+                @ rest_matrices[joint.child_body]
+            )
+            # Generated rigs deliberately map every canonical hinge to the
+            # pose bone's local Z rotation channel.
+            axis = (0.0, 0.0, 1.0)
+        dynamic = rest_relative.inverted_safe() @ relative
+        result.append(_twist_angle(dynamic.to_quaternion(), axis))
     return tuple(result)
 
 
@@ -40,3 +53,22 @@ def body_samples(matrices, profile) -> tuple[np.ndarray, np.ndarray]:
         positions.append(tuple(location))
         quaternions.append((rotation.w, rotation.x, rotation.y, rotation.z))
     return np.asarray(positions, dtype=np.float64), np.asarray(quaternions, dtype=np.float64)
+
+
+def canonical_body_matrices(root_world: Matrix, joint_angles, profile) -> dict[str, Matrix]:
+    """Rebuild MJCF body frames from the Blender-calibrated root and joint state."""
+    angles = dict(zip(profile.joint_names, joint_angles))
+    joint_by_child = {joint.child_body: joint for joint in profile.joints}
+    result = {}
+    for body in profile.bodies:
+        if body.parent is None:
+            result[body.name] = root_world
+            continue
+        local = _rest_matrix(body)
+        joint = joint_by_child.get(body.name)
+        if joint is not None:
+            local = local @ Matrix.Rotation(
+                angles[joint.name], 4, Vector(joint.axis).normalized()
+            )
+        result[body.name] = result[body.parent] @ local
+    return result

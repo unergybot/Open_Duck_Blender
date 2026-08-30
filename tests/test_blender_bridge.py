@@ -3,7 +3,11 @@ import unittest
 
 from mathutils import Matrix, Quaternion, Vector
 
-from open_duck_tools.blender_bridge import body_samples, joint_angles_from_body_matrices
+from open_duck_tools.blender_bridge import (
+    body_samples,
+    canonical_body_matrices,
+    joint_angles_from_body_matrices,
+)
 from open_duck_tools.profile import BodySpec, JointSpec, RobotProfile
 
 
@@ -53,6 +57,30 @@ class BlenderBridgeTests(unittest.TestCase):
         expected = [math.cos(0.2), 0.0, 0.0, math.sin(0.2)]
         for actual, wanted in zip(quaternions[1], expected):
             self.assertAlmostEqual(actual, wanted, places=6)
+
+    def test_extracts_generated_bone_local_z_after_blender_rest_orientation(self):
+        angle = -0.27
+        root_rest = Matrix.Rotation(0.7, 4, "X")
+        child_local_rest = Matrix.Translation((0.0, 0.2, 0.0)) @ Matrix.Rotation(0.4, 4, "Y")
+        child_rest = root_rest @ child_local_rest
+        matrices = {
+            "root": root_rest,
+            "child": child_rest @ Matrix.Rotation(angle, 4, "Z"),
+        }
+        result = joint_angles_from_body_matrices(
+            matrices,
+            self.profile(),
+            {"root": root_rest, "child": child_rest},
+        )
+        self.assertAlmostEqual(result[0], angle, places=6)
+
+    def test_rebuilds_canonical_mjcf_body_frames(self):
+        root = Matrix.Translation((0.0, 0.0, 0.3))
+        matrices = canonical_body_matrices(root, (0.5,), self.profile())
+        expected = root @ Matrix.Translation((1.0, 0.0, 0.0)) @ Matrix.Rotation(0.5, 4, "Z")
+        for row in range(4):
+            for column in range(4):
+                self.assertAlmostEqual(matrices["child"][row][column], expected[row][column])
 
 
 if __name__ == "__main__":

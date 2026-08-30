@@ -9,7 +9,11 @@ from bpy_extras.io_utils import ExportHelper
 from mathutils import Matrix, Quaternion
 import numpy as np
 
-from .blender_bridge import body_samples, joint_angles_from_body_matrices
+from .blender_bridge import (
+    body_samples,
+    canonical_body_matrices,
+    joint_angles_from_body_matrices,
+)
 from .motion import MotionError, build_motion_archive, save_motion_npz
 from .profile import ProfileError, profile_from_json
 
@@ -51,6 +55,13 @@ def _evaluated_body_matrices(armature: bpy.types.Object, body_names) -> dict:
     }
 
 
+def _rest_body_matrices(armature: bpy.types.Object, body_names) -> dict:
+    missing = [name for name in body_names if armature.data.bones.get(name) is None]
+    if missing:
+        raise MotionError(f"armature is missing rest bones: {', '.join(missing)}")
+    return {name: armature.data.bones[name].matrix_local.copy() for name in body_names}
+
+
 def collect_armature_motion(
     armature: bpy.types.Object,
     profile,
@@ -64,12 +75,25 @@ def collect_armature_motion(
     joint_frames = []
     body_positions = []
     body_quaternions = []
+    rest_matrices = _rest_body_matrices(armature, profile.body_names)
+    root_name = next(body.name for body in profile.bodies if body.parent is None)
+    root_spec = next(body for body in profile.bodies if body.name == root_name)
+    root_mjcf_rest = Matrix.Translation(root_spec.position) @ Quaternion(
+        root_spec.quaternion_wxyz
+    ).to_matrix().to_4x4()
     try:
         for frame in range(frame_start, frame_end + 1):
             scene.frame_set(frame)
             matrices = _evaluated_body_matrices(armature, profile.body_names)
-            joint_frames.append(joint_angles_from_body_matrices(matrices, profile))
-            positions, quaternions = body_samples(matrices, profile)
+            angles = joint_angles_from_body_matrices(matrices, profile, rest_matrices)
+            joint_frames.append(angles)
+            root_world = (
+                matrices[root_name]
+                @ rest_matrices[root_name].inverted_safe()
+                @ root_mjcf_rest
+            )
+            canonical = canonical_body_matrices(root_world, angles, profile)
+            positions, quaternions = body_samples(canonical, profile)
             body_positions.append(positions)
             body_quaternions.append(quaternions)
     finally:
