@@ -9,6 +9,7 @@ import bpy
 import numpy as np
 
 from open_duck_tools.builder import generate_microduck_scene
+from open_duck_tools.motion import MotionError, build_motion_archive
 from open_duck_tools import addon
 from open_duck_tools.profile import ProfileError, build_microduck_profile
 
@@ -156,17 +157,25 @@ class SceneBuilderTests(unittest.TestCase):
             runtime.write_text(RUNTIME)
             mouth.write_text(json.dumps(mouth_payload()))
             write_binary_stl(root / "assets" / "jaw.stl")
-            joint_pos = np.zeros((51, 1), dtype=np.float32)
-            joint_pos[25, 0] = 0.4
-            np.savez_compressed(
-                motion,
-                fps=np.array([50], dtype=np.int32),
-                joint_names=np.array(["hinge"]),
-                joint_pos=joint_pos,
-            )
             profile = build_microduck_profile(
                 mjcf, runtime, mouth, expected_joint_count=1, expected_body_count=3
             )
+            joint_pos = np.zeros((51, 1), dtype=np.float32)
+            joint_pos[25, 0] = 0.4
+            body_pos = np.zeros((51, 3, 3), dtype=np.float32)
+            body_pos[:, :, 2] = 0.12
+            body_pos[:, 0, 0] = np.linspace(0.0, 0.5, 51)
+            archive = build_motion_archive(
+                joint_pos,
+                body_pos,
+                np.tile(np.array([1.0, 0.0, 0.0, 0.0]), (51, 3, 1)),
+                fps=50,
+                joint_names=profile.joint_names,
+                body_names=profile.body_names,
+                joint_ranges=tuple(joint.range_rad for joint in profile.joints),
+                source_hashes={"fixture": "deadbeef"},
+            )
+            np.savez_compressed(motion, **archive)
             armature = generate_microduck_scene(
                 profile,
                 mjcf,
@@ -180,8 +189,10 @@ class SceneBuilderTests(unittest.TestCase):
         bpy.context.scene.frame_set(26)
         self.assertAlmostEqual(armature.pose.bones["child"].rotation_euler.z, 0.4, places=6)
         self.assertAlmostEqual(armature.duck_mouth_open, 1.0, places=6)
+        bpy.context.scene.frame_set(51)
+        self.assertAlmostEqual(armature.location.x, 0.5, places=6)
 
-    def test_rejects_malformed_demo_archives_with_profile_error(self):
+    def test_rejects_malformed_demo_archives_with_motion_error(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "assets").mkdir()
@@ -227,7 +238,7 @@ class SceneBuilderTests(unittest.TestCase):
                 motion = root / f"malformed-{index}.npz"
                 np.savez_compressed(motion, **payload)
                 with self.subTest(index=index), self.assertRaisesRegex(
-                    ProfileError, "demo motion"
+                    MotionError, "archive|fps"
                 ):
                     generate_microduck_scene(
                         profile,
