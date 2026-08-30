@@ -184,6 +184,12 @@ def _leg_body_chain(profile, side: str) -> list[str]:
     return [by_joint[name] for name in names if name in by_joint]
 
 
+def _ankle_target_matrix(armature_world: Matrix, ankle_matrix: Matrix, ankle_tail):
+    target = armature_world @ ankle_matrix
+    target.translation = armature_world @ ankle_tail
+    return target
+
+
 class DUCK_OT_switch_ik(bpy.types.Operator):
     bl_idname = "duck.switch_ik"
     bl_label = "Switch to IK"
@@ -199,7 +205,9 @@ class DUCK_OT_switch_ik(bpy.types.Operator):
             if ankle is None or target is None:
                 self.report({"ERROR"}, f"Missing {side} IK controls")
                 return {"CANCELLED"}
-            target.matrix_world = armature.matrix_world @ ankle.matrix
+            target.matrix_world = _ankle_target_matrix(
+                armature.matrix_world, ankle.matrix, ankle.tail
+            )
             for constraint in ankle.constraints:
                 if constraint.name.startswith("DUCK_IK"):
                     constraint.influence = 1.0
