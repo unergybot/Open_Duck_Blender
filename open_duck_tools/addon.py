@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 
 import bpy
-from bpy_extras.io_utils import ExportHelper
+from bpy_extras.io_utils import ExportHelper, ImportHelper
 from mathutils import Matrix, Quaternion
 import numpy as np
 
@@ -15,6 +16,7 @@ from .blender_bridge import (
     joint_angles_from_body_matrices,
 )
 from .motion import MotionError, build_motion_archive, save_motion_npz
+from .motion_import import import_motion_action
 from .profile import ProfileError, profile_from_json
 
 
@@ -250,6 +252,42 @@ class DUCK_OT_switch_fk(bpy.types.Operator):
         return {"FINISHED"}
 
 
+def _default_motion_action_name(filepath: str) -> str:
+    stem = Path(filepath).stem
+    sanitized = re.sub(r"[^A-Za-z0-9]+", "_", stem).strip("_")
+    return sanitized or "ImportedMotion"
+
+
+class DUCK_OT_import_motion(bpy.types.Operator, ImportHelper):
+    bl_idname = "duck.import_motion"
+    bl_label = "Import mjlab Motion"
+    bl_description = "Import a native mjlab motion archive as a new action"
+    filename_ext = ".npz"
+    filter_glob: bpy.props.StringProperty(default="*.npz", options={"HIDDEN"})
+    action_name: bpy.props.StringProperty(name="Action Name", default="")
+
+    def execute(self, context):
+        armature = context.object
+        if armature is None or armature.type != "ARMATURE":
+            self.report({"WARNING"}, "Select a duck armature before importing motion")
+            return {"CANCELLED"}
+        try:
+            profile = profile_from_armature(armature)
+            action_name = self.action_name.strip() or _default_motion_action_name(self.filepath)
+            action = import_motion_action(
+                armature,
+                profile,
+                Path(self.filepath),
+                action_name=action_name,
+            )
+        except (MotionError, ProfileError, OSError, ValueError) as exc:
+            self.report({"WARNING"}, str(exc))
+            return {"CANCELLED"}
+        frame_count = context.scene.frame_end - context.scene.frame_start + 1
+        self.report({"INFO"}, f"Imported {action.name} ({frame_count} frames)")
+        return {"FINISHED"}
+
+
 class DUCK_OT_export_motion(bpy.types.Operator, ExportHelper):
     bl_idname = "duck.export_motion"
     bl_label = "Export mjlab Motion"
@@ -297,10 +335,17 @@ class DUCK_PT_tools(bpy.types.Panel):
         row = layout.row(align=True)
         row.operator("duck.switch_fk")
         row.operator("duck.switch_ik")
+        layout.operator("duck.import_motion", icon="IMPORT")
         layout.operator("duck.export_motion", icon="EXPORT")
 
 
-CLASSES = (DUCK_OT_switch_ik, DUCK_OT_switch_fk, DUCK_OT_export_motion, DUCK_PT_tools)
+CLASSES = (
+    DUCK_OT_switch_ik,
+    DUCK_OT_switch_fk,
+    DUCK_OT_import_motion,
+    DUCK_OT_export_motion,
+    DUCK_PT_tools,
+)
 
 
 def register():

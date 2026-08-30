@@ -182,6 +182,31 @@ uv run scripts/validate_blender_motion.py /path/to/motion.npz
 The validator checks the schema, exact joint/body ordering, 50 Hz metadata,
 finite arrays, and replays every frame through the canonical MuJoCo model.
 
+### Import a policy rollout into Blender
+
+Export a motion archive from the sibling `microduck_rl` checkout first:
+
+```bash
+cd ~/MyCode/microduck_rl
+uv run scripts/export_policy_rollout.py \
+  ~/MyCode/microduck/policies/alpha_walking.onnx \
+  --output /tmp/alpha-walking-forward.npz \
+  --duration 4 \
+  --lin-vel-x 0.15 \
+  --seed 0
+uv run scripts/validate_blender_motion.py /tmp/alpha-walking-forward.npz
+```
+
+Open `microduck-alpha.blend`, select the Microduck armature, and choose **Open
+Duck → Import mjlab Motion** in the 3D View sidebar. Pick the generated `.npz`
+file. Leave **Action Name** empty to use a deterministic name derived from the
+file name, or set it before importing to choose the action name. The imported
+action becomes active, preserves the archive's root translation and rotation,
+and sets the scene to the archive frame range at 50 Hz. Importing never changes
+`duck_mouth_open`: the articulated mouth is visual-only and excluded from the
+14-joint policy archive. Use **Open Duck → Export mjlab Motion** to export the
+active imported action again.
+
 `microduck-alpha.blend` includes a 51-frame neutral-to-crouch-to-neutral test
 action. Its verified export is stored at
 `assets/motions/microduck-crouch-test.npz`; the animated mouth is visual-only
