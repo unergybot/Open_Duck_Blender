@@ -10,7 +10,7 @@ import numpy as np
 
 from open_duck_tools.builder import generate_microduck_scene
 from open_duck_tools import addon
-from open_duck_tools.profile import build_microduck_profile
+from open_duck_tools.profile import ProfileError, build_microduck_profile
 
 
 MJCF = """
@@ -144,7 +144,7 @@ class SceneBuilderTests(unittest.TestCase):
             places=6,
         )
 
-    def test_builds_demo_action_from_native_motion_archive(self):
+    def test_builds_51_frame_demo_action_from_native_motion_archive(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "assets").mkdir()
@@ -156,11 +156,13 @@ class SceneBuilderTests(unittest.TestCase):
             runtime.write_text(RUNTIME)
             mouth.write_text(json.dumps(mouth_payload()))
             write_binary_stl(root / "assets" / "jaw.stl")
+            joint_pos = np.zeros((51, 1), dtype=np.float32)
+            joint_pos[25, 0] = 0.4
             np.savez_compressed(
                 motion,
                 fps=np.array([50], dtype=np.int32),
                 joint_names=np.array(["hinge"]),
-                joint_pos=np.array([[0.0], [0.4], [0.0]], dtype=np.float32),
+                joint_pos=joint_pos,
             )
             profile = build_microduck_profile(
                 mjcf, runtime, mouth, expected_joint_count=1, expected_body_count=3
@@ -172,12 +174,47 @@ class SceneBuilderTests(unittest.TestCase):
                 demo_motion_path=motion,
             )
 
-        self.assertEqual((bpy.context.scene.frame_start, bpy.context.scene.frame_end), (1, 3))
+        self.assertEqual((bpy.context.scene.frame_start, bpy.context.scene.frame_end), (1, 51))
         self.assertIsNotNone(armature.animation_data)
         self.assertEqual(armature.animation_data.action.name, "MicroduckCrouchTest")
-        bpy.context.scene.frame_set(2)
+        bpy.context.scene.frame_set(26)
         self.assertAlmostEqual(armature.pose.bones["child"].rotation_euler.z, 0.4, places=6)
         self.assertAlmostEqual(armature.duck_mouth_open, 1.0, places=6)
+
+    def test_rejects_malformed_demo_archives_with_profile_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "assets").mkdir()
+            mjcf = root / "robot_walk.xml"
+            runtime = root / "model.rs"
+            mouth = root / "mouth.json"
+            mjcf.write_text(MJCF)
+            runtime.write_text(RUNTIME)
+            mouth.write_text(json.dumps(mouth_payload()))
+            write_binary_stl(root / "assets" / "jaw.stl")
+            profile = build_microduck_profile(
+                mjcf, runtime, mouth, expected_joint_count=1, expected_body_count=3
+            )
+            malformed = (
+                {"joint_names": np.array(["hinge"]), "joint_pos": np.array([[0.0]])},
+                {
+                    "fps": np.array([50]),
+                    "joint_names": np.array(["hinge"]),
+                    "joint_pos": np.array(0.0),
+                },
+            )
+            for index, payload in enumerate(malformed):
+                motion = root / f"malformed-{index}.npz"
+                np.savez_compressed(motion, **payload)
+                with self.subTest(index=index), self.assertRaisesRegex(
+                    ProfileError, "demo motion"
+                ):
+                    generate_microduck_scene(
+                        profile,
+                        mjcf,
+                        Path("open_duck_tools"),
+                        demo_motion_path=motion,
+                    )
 
 
 if __name__ == "__main__":

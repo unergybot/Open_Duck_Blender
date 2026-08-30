@@ -167,7 +167,7 @@ blender --background --factory-startup \
   --rl-root ~/MyCode/microduck_rl
 ```
 
-Add `-- --mouth-linkage /path/to/authorized-mouth-linkage.json` when the
+Append `--mouth-linkage /path/to/authorized-mouth-linkage.json` when the
 authoritative package is available.
 
 This writes `microduck-alpha.blend`. Open it with automatic Python execution

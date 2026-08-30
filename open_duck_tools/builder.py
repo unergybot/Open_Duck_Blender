@@ -251,16 +251,30 @@ def _create_visuals(profile, mjcf_path: Path, armature, world_rest):
 
 
 def _create_demo_action(armature, profile, motion_path: Path) -> None:
-    with np.load(motion_path, allow_pickle=False) as archive:
-        fps = np.asarray(archive["fps"])
-        joint_names = tuple(str(name) for name in archive["joint_names"])
-        joint_pos = np.asarray(archive["joint_pos"], dtype=np.float64)
+    try:
+        with np.load(motion_path, allow_pickle=False) as archive:
+            required = {"fps", "joint_names", "joint_pos"}
+            missing = required - set(archive.files)
+            if missing:
+                raise ProfileError(
+                    f"demo motion is missing keys: {', '.join(sorted(missing))}"
+                )
+            fps = np.asarray(archive["fps"])
+            joint_names = tuple(str(name) for name in archive["joint_names"])
+            joint_pos = np.asarray(archive["joint_pos"], dtype=np.float64)
+    except ProfileError:
+        raise
+    except (KeyError, OSError, ValueError) as exc:
+        raise ProfileError(f"demo motion could not be loaded: {exc}") from exc
     if fps.shape != (1,) or int(fps[0]) != 50:
         raise ProfileError("demo motion must declare fps=[50]")
     if joint_names != tuple(profile.joint_names):
         raise ProfileError("demo motion joint_names do not match the robot profile")
-    expected_shape = (joint_pos.shape[0], len(profile.joint_names))
-    if joint_pos.ndim != 2 or joint_pos.shape != expected_shape or not joint_pos.shape[0]:
+    if (
+        joint_pos.ndim != 2
+        or not joint_pos.shape[0]
+        or joint_pos.shape[1] != len(profile.joint_names)
+    ):
         raise ProfileError("demo motion joint_pos must have shape [T, joint_count]")
     if not np.isfinite(joint_pos).all():
         raise ProfileError("demo motion joint_pos contains a non-finite value")
