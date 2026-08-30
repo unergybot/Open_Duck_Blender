@@ -10,6 +10,9 @@
 
 The project provides an FK/IK control system along with a reference data recording addon designed for training reinforcement learning policies.
 
+Mini Duck remains available unchanged in `open-duck-mini.blend`. Microduck support
+is generated separately from the canonical runtime and `microduck_rl` sources.
+
 ---
 
 ## Requirements & Installation
@@ -130,3 +133,43 @@ uv run playground/open_duck_mini_v2/ref_motion_viewer_episodic.py --reference-da
 
 ### Use recorded data to train RL policies
 TODO
+
+## Microduck project generation
+
+The Microduck project targets the 14 policy joints and 15 MJCF bodies at 50 Hz.
+It includes FK/IK leg controls, an articulated mouth control, Cream/Graphite/
+Lavender/Sky colourways, and native `.npz` export for `microduck_rl`.
+
+The public MJCF/STLs do not contain the complete grasping-beak mechanism. The
+[official Microduck site](https://pollen-robotics.com/microduck/) describes an
+articulated beak, while its press kit states that the mechanical hardware is not
+open source. By default the generator therefore creates a clearly marked,
+image-derived single-hinge presentation rig. It is suitable for animation but
+not a mechanically validated grasp simulation. An authorized CAD/mates export
+matching `assets/microduck/mouth-linkage.schema.json` replaces the approximation.
+
+With `microduck`, `microduck_rl`, and this repository under `~/MyCode`:
+
+```bash
+blender --background --factory-startup \
+  --python tools/build_microduck_blend.py
+```
+
+Add `-- --mouth-linkage /path/to/authorized-mouth-linkage.json` when the
+authoritative package is available.
+
+This writes `microduck-alpha.blend`. Open it with automatic Python execution
+allowed, animate the selected armature, then use **Open Duck → Export mjlab
+Motion**. Validate the result from the `microduck_rl` checkout:
+
+```bash
+uv run scripts/validate_blender_motion.py /path/to/motion.npz
+```
+
+The validator checks the schema, exact joint/body ordering, 50 Hz metadata,
+finite arrays, and replays every frame through the canonical MuJoCo model.
+
+`microduck-alpha.blend` includes a 51-frame neutral-to-crouch-to-neutral test
+action. Its verified export is stored at
+`assets/motions/microduck-crouch-test.npz`; the animated mouth is visual-only
+and remains outside the 14-joint policy archive.

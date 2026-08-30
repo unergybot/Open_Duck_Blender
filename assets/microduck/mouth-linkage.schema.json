@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pollen-robotics.com/schemas/microduck-mouth-linkage-v1.json",
+  "title": "Authorized Microduck mouth linkage export",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "units", "servo", "links", "samples", "validation_poses"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "units": {"const": "m"},
+    "servo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "closed_rad", "open_rad"],
+      "properties": {
+        "name": {"const": "mouth"},
+        "closed_rad": {"type": "number"},
+        "open_rad": {"type": "number"}
+      }
+    },
+    "links": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "meshes", "parent"],
+        "properties": {
+          "name": {"type": "string", "minLength": 1},
+          "meshes": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+          "parent": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "samples": {"$ref": "#/$defs/poseSamples"},
+    "validation_poses": {"$ref": "#/$defs/poseSamples"}
+  },
+  "$defs": {
+    "poseSamples": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["servo_rad", "poses"],
+        "properties": {
+          "servo_rad": {"type": "number"},
+          "poses": {
+            "type": "object",
+            "minProperties": 1,
+            "additionalProperties": {"$ref": "#/$defs/pose"}
+          }
+        }
+      }
+    },
+    "pose": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["position", "quaternion_wxyz"],
+      "properties": {
+        "position": {"type": "array", "minItems": 3, "maxItems": 3, "items": {"type": "number"}},
+        "quaternion_wxyz": {"type": "array", "minItems": 4, "maxItems": 4, "items": {"type": "number"}}
+      }
+    }
+  }
+}
