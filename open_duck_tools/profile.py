@@ -340,11 +340,11 @@ def approximate_mouth_linkage() -> MouthLinkage:
         "basis": "squad.webp visual reference plus canonical jaw STL coordinate frame",
         "pivot_m": pivot,
         "axis": "jaw_soft local +Y",
-        "meshes": ["jaw", "jaw_soft", "bottom_head_shell"],
+        "meshes": ["jaw", "jaw_soft"],
     }
     link = MouthLink(
         "approximate_lower_beak",
-        ("jaw", "jaw_soft", "bottom_head_shell"),
+        ("jaw", "jaw_soft"),
         "jaw_soft",
     )
     samples = (

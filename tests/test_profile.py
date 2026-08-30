@@ -86,7 +86,7 @@ def linkage_payload():
 class MouthLinkageTests(unittest.TestCase):
     def test_approximation_is_versioned_and_owns_lower_beak_meshes(self):
         linkage = approximate_mouth_linkage()
-        self.assertEqual(linkage.links[0].meshes, ("jaw", "jaw_soft", "bottom_head_shell"))
+        self.assertEqual(linkage.links[0].meshes, ("jaw", "jaw_soft"))
         self.assertEqual(linkage.closed_rad, math.radians(-5))
         self.assertEqual(linkage.open_rad, math.radians(30))
         self.assertTrue(linkage.source_sha256)
