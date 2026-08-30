@@ -9,8 +9,7 @@ import xml.etree.ElementTree as ET
 
 import bpy
 from mathutils import Matrix, Quaternion, Vector
-import numpy as np
-
+from .motion_import import import_motion_action
 from .profile import ProfileError, profile_to_json
 
 
@@ -67,7 +66,7 @@ def _material(name: str, rgba: tuple[float, float, float, float]):
 
 
 def _embed_addon(addon_source_root: Path) -> None:
-    module_names = ("profile", "motion", "blender_bridge", "addon")
+    module_names = ("profile", "motion", "blender_bridge", "motion_import", "addon")
     for name in module_names:
         path = addon_source_root / f"{name}.py"
         if not path.exists():
@@ -79,7 +78,7 @@ def _embed_addon(addon_source_root: Path) -> None:
         text.write(path.read_text())
     bootstrap_source = '''import bpy, sys, types
 
-MODULES = ("profile", "motion", "blender_bridge", "addon")
+MODULES = ("profile", "motion", "blender_bridge", "motion_import", "addon")
 PACKAGE = "open_duck_tools_embedded"
 
 def register():
@@ -250,62 +249,12 @@ def _create_visuals(profile, mjcf_path: Path, armature, world_rest):
         raise ProfileError(f"mouth linkage references meshes absent from visual MJCF: {sorted(missing)}")
 
 
-def _create_demo_action(armature, profile, motion_path: Path) -> None:
-    try:
-        with np.load(motion_path, allow_pickle=False) as archive:
-            required = {"fps", "joint_names", "joint_pos"}
-            missing = required - set(archive.files)
-            if missing:
-                raise ProfileError(
-                    f"demo motion is missing keys: {', '.join(sorted(missing))}"
-                )
-            fps = np.asarray(archive["fps"])
-            joint_names = tuple(str(name) for name in archive["joint_names"])
-            joint_pos = np.asarray(archive["joint_pos"], dtype=np.float64)
-    except ProfileError:
-        raise
-    except (KeyError, OSError, ValueError) as exc:
-        raise ProfileError(f"demo motion could not be loaded: {exc}") from exc
-    if fps.shape != (1,):
-        raise ProfileError("demo motion must declare fps=[50]")
-    try:
-        fps_value = float(fps[0])
-    except (TypeError, ValueError) as exc:
-        raise ProfileError("demo motion must declare fps=[50]") from exc
-    if not np.isfinite(fps_value) or fps_value != 50.0:
-        raise ProfileError("demo motion must declare fps=[50]")
-    if joint_names != tuple(profile.joint_names):
-        raise ProfileError("demo motion joint_names do not match the robot profile")
-    if (
-        joint_pos.ndim != 2
-        or not joint_pos.shape[0]
-        or joint_pos.shape[1] != len(profile.joint_names)
-    ):
-        raise ProfileError("demo motion joint_pos must have shape [T, joint_count]")
-    if not np.isfinite(joint_pos).all():
-        raise ProfileError("demo motion joint_pos contains a non-finite value")
-
-    scene = bpy.context.scene
-    scene.frame_start = 1
-    scene.frame_end = joint_pos.shape[0]
-    joint_by_name = {joint.name: joint for joint in profile.joints}
-    frame_count = joint_pos.shape[0]
-    for index, positions in enumerate(joint_pos):
+def _key_crouch_mouth_curve(armature, frame_count: int) -> None:
+    for index in range(frame_count):
         frame = index + 1
-        for joint_name, angle in zip(profile.joint_names, positions):
-            pose_bone = armature.pose.bones[joint_by_name[joint_name].child_body]
-            pose_bone.rotation_euler.z = float(angle)
-            pose_bone.keyframe_insert(
-                data_path="rotation_euler",
-                index=2,
-                frame=frame,
-                group=joint_name,
-            )
         progress = 0.0 if frame_count == 1 else index / (frame_count - 1)
         armature.duck_mouth_open = 1.0 - abs(2.0 * progress - 1.0)
         armature.keyframe_insert(data_path="duck_mouth_open", frame=frame)
-    armature.animation_data.action.name = "MicroduckCrouchTest"
-    scene.frame_set(scene.frame_start)
 
 
 def generate_microduck_scene(
@@ -323,6 +272,7 @@ def generate_microduck_scene(
             collection.remove(item, do_unlink=True)
     scene = bpy.context.scene
     scene.render.fps = 50
+    scene.render.fps_base = 1.0
     scene.frame_start = 1
     scene.frame_end = 100
     scene.unit_settings.system = "METRIC"
@@ -341,7 +291,14 @@ def generate_microduck_scene(
     _create_visuals(profile, mjcf_path, armature, world_rest)
     _embed_addon(addon_source_root)
     if demo_motion_path is not None:
-        _create_demo_action(armature, profile, Path(demo_motion_path))
+        import_motion_action(
+            armature,
+            profile,
+            Path(demo_motion_path),
+            action_name="MicroduckCrouchTest",
+        )
+        _key_crouch_mouth_curve(armature, scene.frame_end)
+        scene.frame_set(scene.frame_start)
     bpy.context.view_layer.objects.active = armature
     armature.select_set(True)
     return armature
