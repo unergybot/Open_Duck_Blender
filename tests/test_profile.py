@@ -8,6 +8,8 @@ from open_duck_tools.profile import (
     ProfileError,
     build_microduck_profile,
     load_mouth_linkage,
+    profile_from_json,
+    profile_to_json,
 )
 
 
@@ -132,6 +134,13 @@ class ProfileBuildTests(unittest.TestCase):
             mjcf, runtime, mouth = self.write_sources(Path(directory), drifted)
             with self.assertRaisesRegex(ProfileError, "joint order"):
                 build_microduck_profile(mjcf, runtime, mouth)
+
+    def test_profile_json_round_trip_preserves_typed_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            mjcf, runtime, mouth = self.write_sources(Path(directory))
+            original = build_microduck_profile(mjcf, runtime, mouth)
+            restored = profile_from_json(profile_to_json(original))
+        self.assertEqual(restored, original)
 
 
 if __name__ == "__main__":

@@ -79,6 +79,71 @@ class RobotProfile:
         return asdict(self)
 
 
+def profile_to_json(profile: RobotProfile) -> str:
+    return json.dumps(profile.to_dict(), sort_keys=True, separators=(",", ":"))
+
+
+def profile_from_json(value: str) -> RobotProfile:
+    try:
+        payload = json.loads(value)
+        mouth_payload = payload["mouth"]
+
+        def make_sample(sample):
+            return MouthSample(
+                float(sample["servo_rad"]),
+                {
+                    name: Pose(
+                        tuple(pose["position"]),
+                        tuple(pose["quaternion_wxyz"]),
+                    )
+                    for name, pose in sample["poses"].items()
+                },
+            )
+
+        mouth = MouthLinkage(
+            int(mouth_payload["schema_version"]),
+            float(mouth_payload["closed_rad"]),
+            float(mouth_payload["open_rad"]),
+            tuple(
+                MouthLink(link["name"], tuple(link["meshes"]), link["parent"])
+                for link in mouth_payload["links"]
+            ),
+            tuple(make_sample(sample) for sample in mouth_payload["samples"]),
+            tuple(make_sample(sample) for sample in mouth_payload["validation_poses"]),
+            mouth_payload["source_sha256"],
+        )
+        return RobotProfile(
+            int(payload["schema_version"]),
+            payload["robot_id"],
+            tuple(payload["joint_names"]),
+            tuple(payload["body_names"]),
+            tuple(float(value) for value in payload["home_positions"]),
+            tuple(
+                JointSpec(
+                    joint["name"],
+                    joint["parent_body"],
+                    joint["child_body"],
+                    tuple(joint["axis"]),
+                    tuple(joint["range_rad"]),
+                )
+                for joint in payload["joints"]
+            ),
+            tuple(
+                BodySpec(
+                    body["name"],
+                    body["parent"],
+                    tuple(body["position"]),
+                    tuple(body["quaternion_wxyz"]),
+                )
+                for body in payload["bodies"]
+            ),
+            mouth,
+            dict(payload["source_sha256"]),
+        )
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ProfileError(f"embedded robot profile is malformed: {exc}") from exc
+
+
 def _vector(value: str | None, size: int, default: tuple[float, ...]) -> tuple[float, ...]:
     if value is None:
         return default
