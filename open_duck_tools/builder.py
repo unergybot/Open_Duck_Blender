@@ -56,10 +56,12 @@ def _material(name: str, rgba: tuple[float, float, float, float]):
         node.inputs["Base Color"].default_value = rgba
         node.inputs["Roughness"].default_value = 0.55
     lowered = name.lower()
-    if "shell" in lowered:
-        material["duck_material_role"] = "shell"
-    elif any(token in lowered for token in ("jaw", "foot", "ankle", "trim")):
+    if "bottom_head_shell" in lowered or any(
+        token in lowered for token in ("jaw", "foot", "ankle", "trim")
+    ):
         material["duck_material_role"] = "trim"
+    elif "shell" in lowered:
+        material["duck_material_role"] = "shell"
     return material
 
 

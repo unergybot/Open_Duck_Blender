@@ -73,7 +73,7 @@ def linkage_payload():
                 "servo_rad": math.radians(3.25),
                 "poses": {
                     "lower_beak": {
-                        "position": [0.001, 0.0, 0.0],
+                        "position": [0.0, 0.0, 0.0],
                         "quaternion_wxyz": [1.0, 0.0, 0.0, 0.0],
                     }
                 },
@@ -102,6 +102,24 @@ class MouthLinkageTests(unittest.TestCase):
         self.assertEqual(linkage.links[0].name, "lower_beak")
         self.assertEqual(linkage.samples[1].poses["lower_beak"].quaternion_wxyz, (1, 0, 0, 0))
 
+    def test_rejects_validation_pose_that_disagrees_with_samples(self):
+        payload = linkage_payload()
+        payload["validation_poses"][0]["poses"]["lower_beak"]["position"][0] = 0.001
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mouth.json"
+            path.write_text(json.dumps(payload))
+            with self.assertRaisesRegex(ProfileError, "disagrees with samples"):
+                load_mouth_linkage(path)
+
+    def test_rejects_undeclared_nested_fields(self):
+        payload = linkage_payload()
+        payload["servo"]["untrusted"] = True
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mouth.json"
+            path.write_text(json.dumps(payload))
+            with self.assertRaisesRegex(ProfileError, "servo fields"):
+                load_mouth_linkage(path)
+
 
 class ProfileBuildTests(unittest.TestCase):
     def write_sources(self, root: Path, runtime=RUNTIME_MODEL):
@@ -116,7 +134,9 @@ class ProfileBuildTests(unittest.TestCase):
     def test_builds_policy_order_by_removing_only_mouth(self):
         with tempfile.TemporaryDirectory() as directory:
             mjcf, runtime, mouth = self.write_sources(Path(directory))
-            profile = build_microduck_profile(mjcf, runtime, mouth)
+            profile = build_microduck_profile(
+                mjcf, runtime, mouth, expected_joint_count=3, expected_body_count=4
+            )
         self.assertEqual(
             profile.joint_names,
             ("left_hip_yaw", "head_pitch", "right_hip_yaw"),
@@ -124,6 +144,12 @@ class ProfileBuildTests(unittest.TestCase):
         self.assertEqual(profile.body_names, ("trunk_base", "left_link", "head_link", "right_link"))
         self.assertEqual(profile.home_positions, (0.1, 0.2, -0.1))
         self.assertEqual(profile.joints[0].range_rad, (-0.4, 0.5))
+
+    def test_default_contract_rejects_non_microduck_cardinality(self):
+        with tempfile.TemporaryDirectory() as directory:
+            mjcf, runtime, mouth = self.write_sources(Path(directory))
+            with self.assertRaisesRegex(ProfileError, "14 policy joints and 15 bodies"):
+                build_microduck_profile(mjcf, runtime, mouth)
 
     def test_rejects_runtime_and_mjcf_order_drift(self):
         drifted = RUNTIME_MODEL.replace(
@@ -133,12 +159,16 @@ class ProfileBuildTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             mjcf, runtime, mouth = self.write_sources(Path(directory), drifted)
             with self.assertRaisesRegex(ProfileError, "joint order"):
-                build_microduck_profile(mjcf, runtime, mouth)
+                build_microduck_profile(
+                    mjcf, runtime, mouth, expected_joint_count=3, expected_body_count=4
+                )
 
     def test_profile_json_round_trip_preserves_typed_contract(self):
         with tempfile.TemporaryDirectory() as directory:
             mjcf, runtime, mouth = self.write_sources(Path(directory))
-            original = build_microduck_profile(mjcf, runtime, mouth)
+            original = build_microduck_profile(
+                mjcf, runtime, mouth, expected_joint_count=3, expected_body_count=4
+            )
             restored = profile_from_json(profile_to_json(original))
         self.assertEqual(restored, original)
 

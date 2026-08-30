@@ -16,6 +16,11 @@ class ProfileError(ValueError):
     """A robot source violates the versioned profile contract."""
 
 
+def _require_exact_fields(payload: Any, allowed: set[str], field: str) -> None:
+    if not isinstance(payload, dict) or set(payload) != allowed:
+        raise ProfileError(f"{field} fields must be exactly {sorted(allowed)}")
+
+
 @dataclass(frozen=True)
 class Pose:
     position: tuple[float, float, float]
@@ -177,12 +182,39 @@ def _vector_from_json(value: Any, size: int, field: str) -> tuple[float, ...]:
 
 
 def _pose(payload: Any, field: str) -> Pose:
-    if not isinstance(payload, dict):
-        raise ProfileError(f"{field} must be an object")
+    _require_exact_fields(payload, {"position", "quaternion_wxyz"}, field)
     return Pose(
         _vector_from_json(payload.get("position"), 3, f"{field}.position"),
         _unit_quaternion(payload.get("quaternion_wxyz"), f"{field}.quaternion_wxyz"),
     )
+
+
+def _interpolated_pose(samples: tuple[MouthSample, ...], angle: float, link: str) -> Pose:
+    upper = next((index for index, item in enumerate(samples) if item.servo_rad >= angle), None)
+    if upper is None or angle < samples[0].servo_rad:
+        raise ProfileError("validation pose servo angle lies outside sampled range")
+    lower = max(0, upper - 1)
+    a = samples[lower]
+    b = samples[upper]
+    span = b.servo_rad - a.servo_rad
+    blend = 0.0 if abs(span) < 1e-12 else (angle - a.servo_rad) / span
+    pa, pb = a.poses[link], b.poses[link]
+    position = tuple(x + blend * (y - x) for x, y in zip(pa.position, pb.position))
+    qa, qb = pa.quaternion_wxyz, b.poses[link].quaternion_wxyz
+    dot = sum(x * y for x, y in zip(qa, qb))
+    if dot < 0:
+        qb = tuple(-value for value in qb)
+        dot = -dot
+    dot = min(1.0, dot)
+    if dot > 0.9995:
+        quat = tuple(x + blend * (y - x) for x, y in zip(qa, qb))
+    else:
+        theta = math.acos(dot)
+        denominator = math.sin(theta)
+        left = math.sin((1.0 - blend) * theta) / denominator
+        right = math.sin(blend * theta) / denominator
+        quat = tuple(left * x + right * y for x, y in zip(qa, qb))
+    return Pose(position, _unit_quaternion(quat, "interpolated quaternion"))
 
 
 def _samples(payload: Any, link_names: set[str], field: str) -> tuple[MouthSample, ...]:
@@ -190,6 +222,7 @@ def _samples(payload: Any, link_names: set[str], field: str) -> tuple[MouthSampl
         raise ProfileError(f"{field} must contain at least one pose")
     result = []
     for index, sample in enumerate(payload):
+        _require_exact_fields(sample, {"servo_rad", "poses"}, f"{field}[{index}]")
         try:
             servo_rad = float(sample["servo_rad"])
             poses_payload = sample["poses"]
@@ -218,9 +251,12 @@ def load_mouth_linkage(path: str | Path) -> MouthLinkage:
         payload = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise ProfileError(f"mouth linkage is not valid JSON: {exc}") from exc
+    allowed = {"schema_version", "units", "servo", "links", "samples", "validation_poses"}
+    _require_exact_fields(payload, allowed, "mouth linkage")
     if payload.get("schema_version") != 1 or payload.get("units") != "m":
         raise ProfileError("mouth linkage requires schema_version 1 and units 'm'")
     servo = payload.get("servo", {})
+    _require_exact_fields(servo, {"name", "closed_rad", "open_rad"}, "servo")
     if servo.get("name") != "mouth":
         raise ProfileError("mouth linkage servo.name must be 'mouth'")
     try:
@@ -236,6 +272,8 @@ def load_mouth_linkage(path: str | Path) -> MouthLinkage:
     if not isinstance(links_payload, list) or not links_payload:
         raise ProfileError("mouth linkage links must not be empty")
     try:
+        for index, link in enumerate(links_payload):
+            _require_exact_fields(link, {"name", "meshes", "parent"}, f"links[{index}]")
         links = tuple(
             MouthLink(
                 str(link["name"]),
@@ -260,6 +298,22 @@ def load_mouth_linkage(path: str | Path) -> MouthLinkage:
     validation_poses = _samples(
         payload.get("validation_poses"), link_names, "validation_poses"
     )
+    for validation in validation_poses:
+        for link_name, expected in validation.poses.items():
+            actual = _interpolated_pose(samples, validation.servo_rad, link_name)
+            position_error = math.sqrt(
+                sum((a - b) ** 2 for a, b in zip(actual.position, expected.position))
+            )
+            dot = min(
+                1.0,
+                abs(sum(a * b for a, b in zip(actual.quaternion_wxyz, expected.quaternion_wxyz))),
+            )
+            rotation_error = 2.0 * math.acos(dot)
+            if position_error > 1e-5 or rotation_error > 1e-4:
+                raise ProfileError(
+                    f"validation pose for {link_name!r} at {validation.servo_rad} rad "
+                    f"disagrees with samples ({position_error} m, {rotation_error} rad)"
+                )
     return MouthLinkage(
         1,
         closed_rad,
@@ -355,6 +409,9 @@ def build_microduck_profile(
     runtime_model_path: str | Path,
     mouth_linkage_path: str | Path,
     joint_contract_path: str | Path | None = None,
+    *,
+    expected_joint_count: int = 14,
+    expected_body_count: int = 15,
 ) -> RobotProfile:
     mjcf_path = Path(mjcf_path)
     runtime_model_path = Path(runtime_model_path)
@@ -367,6 +424,12 @@ def build_microduck_profile(
         position for name, position in zip(runtime_names, runtime_home) if name != "mouth"
     ]
     bodies, joints = _mjcf_contract(mjcf_path)
+    if len(policy_names) != expected_joint_count or len(bodies) != expected_body_count:
+        raise ProfileError(
+            "Microduck contract requires "
+            f"{expected_joint_count} policy joints and {expected_body_count} bodies; "
+            f"found {len(policy_names)} and {len(bodies)}"
+        )
     mjcf_names = [joint.name for joint in joints]
     if policy_names != mjcf_names:
         raise ProfileError(

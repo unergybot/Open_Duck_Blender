@@ -65,7 +65,15 @@ def mouth_payload():
             },
         ],
         "validation_poses": [
-            {"servo_rad": math.radians(12.5), "poses": {"lower_beak": identity}}
+            {
+                "servo_rad": math.radians(12.5),
+                "poses": {
+                    "lower_beak": {
+                        "position": [0.005, 0, 0],
+                        "quaternion_wxyz": [1, 0, 0, 0],
+                    }
+                },
+            }
         ],
     }
 
@@ -108,7 +116,9 @@ class SceneBuilderTests(unittest.TestCase):
             runtime.write_text(RUNTIME)
             mouth.write_text(json.dumps(mouth_payload()))
             write_binary_stl(root / "assets" / "jaw.stl")
-            profile = build_microduck_profile(mjcf, runtime, mouth)
+            profile = build_microduck_profile(
+                mjcf, runtime, mouth, expected_joint_count=1, expected_body_count=3
+            )
             armature = generate_microduck_scene(profile, mjcf, Path("open_duck_tools"))
 
         self.assertEqual(armature.get("duck_robot_id"), "microduck-alpha")
