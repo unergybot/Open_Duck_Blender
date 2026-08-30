@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 import bpy
+import numpy as np
 
 from open_duck_tools.builder import generate_microduck_scene
 from open_duck_tools import addon
@@ -142,6 +143,41 @@ class SceneBuilderTests(unittest.TestCase):
             0.01,
             places=6,
         )
+
+    def test_builds_demo_action_from_native_motion_archive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "assets").mkdir()
+            mjcf = root / "robot_walk.xml"
+            runtime = root / "model.rs"
+            mouth = root / "mouth.json"
+            motion = root / "demo.npz"
+            mjcf.write_text(MJCF)
+            runtime.write_text(RUNTIME)
+            mouth.write_text(json.dumps(mouth_payload()))
+            write_binary_stl(root / "assets" / "jaw.stl")
+            np.savez_compressed(
+                motion,
+                fps=np.array([50], dtype=np.int32),
+                joint_names=np.array(["hinge"]),
+                joint_pos=np.array([[0.0], [0.4], [0.0]], dtype=np.float32),
+            )
+            profile = build_microduck_profile(
+                mjcf, runtime, mouth, expected_joint_count=1, expected_body_count=3
+            )
+            armature = generate_microduck_scene(
+                profile,
+                mjcf,
+                Path("open_duck_tools"),
+                demo_motion_path=motion,
+            )
+
+        self.assertEqual((bpy.context.scene.frame_start, bpy.context.scene.frame_end), (1, 3))
+        self.assertIsNotNone(armature.animation_data)
+        self.assertEqual(armature.animation_data.action.name, "MicroduckCrouchTest")
+        bpy.context.scene.frame_set(2)
+        self.assertAlmostEqual(armature.pose.bones["child"].rotation_euler.z, 0.4, places=6)
+        self.assertAlmostEqual(armature.duck_mouth_open, 1.0, places=6)
 
 
 if __name__ == "__main__":

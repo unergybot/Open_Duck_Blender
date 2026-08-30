@@ -28,7 +28,7 @@ is generated separately from the canonical runtime and `microduck_rl` sources.
 
 1. **Clone the repository**  
    ```bash
-   git clone https://github.com/pollen-robotics/Open_Duck_Blender
+   git clone https://github.com/unergybot/Open_Duck_Blender.git
    cd Open_Duck_Blender
    ```
 2. **Install git-lfs**
@@ -148,11 +148,23 @@ image-derived single-hinge presentation rig. It is suitable for animation but
 not a mechanically validated grasp simulation. An authorized CAD/mates export
 matching `assets/microduck/mouth-linkage.schema.json` replaces the approximation.
 
-With `microduck`, `microduck_rl`, and this repository under `~/MyCode`:
+Clone the three `unergybot` forks as siblings under `~/MyCode`:
 
 ```bash
+cd ~/MyCode
+git clone https://github.com/unergybot/microduck.git
+git clone https://github.com/unergybot/microduck_rl.git
+git clone https://github.com/unergybot/Open_Duck_Blender.git
+```
+
+Generate the Blender project from those explicit fork checkouts:
+
+```bash
+cd ~/MyCode/Open_Duck_Blender
 blender --background --factory-startup \
-  --python tools/build_microduck_blend.py
+  --python tools/build_microduck_blend.py -- \
+  --runtime-root ~/MyCode/microduck \
+  --rl-root ~/MyCode/microduck_rl
 ```
 
 Add `-- --mouth-linkage /path/to/authorized-mouth-linkage.json` when the
@@ -163,6 +175,7 @@ allowed, animate the selected armature, then use **Open Duck → Export mjlab
 Motion**. Validate the result from the `microduck_rl` checkout:
 
 ```bash
+cd ~/MyCode/microduck_rl
 uv run scripts/validate_blender_motion.py /path/to/motion.npz
 ```
 
@@ -173,3 +186,8 @@ finite arrays, and replays every frame through the canonical MuJoCo model.
 action. Its verified export is stored at
 `assets/motions/microduck-crouch-test.npz`; the animated mouth is visual-only
 and remains outside the 14-joint policy archive.
+
+For a headless acceptance check, rebuild to a temporary path, open the result,
+export frames 1–51 with **Open Duck → Export mjlab Motion**, then run the
+validator above. A valid archive reports 51 frames and sub-micrometre forward-
+kinematics errors.
