@@ -17,6 +17,13 @@ class BuildCliTests(unittest.TestCase):
         args = MODULE._arguments([])
         self.assertIsNone(args.mouth_linkage)
 
+    def test_defaults_to_versioned_crouch_demo_motion(self):
+        args = MODULE._arguments([])
+        self.assertEqual(
+            args.demo_motion,
+            SCRIPT.parents[1] / "assets/motions/microduck-crouch-test.npz",
+        )
+
     def test_reports_all_missing_canonical_sources_before_build(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

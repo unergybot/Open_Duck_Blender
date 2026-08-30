@@ -42,6 +42,12 @@ def _arguments(argv: list[str]) -> argparse.Namespace:
         help="authorized CAD/mates linkage JSON; omit for the image-derived approximate hinge",
     )
     parser.add_argument(
+        "--demo-motion",
+        type=Path,
+        default=REPO_ROOT / "assets/motions/microduck-crouch-test.npz",
+        help="native mjlab motion archive to embed as the demonstration action",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=REPO_ROOT / "microduck-alpha.blend",
@@ -56,7 +62,7 @@ def build(args: argparse.Namespace) -> Path:
     )
     runtime = args.runtime_root / "duck-control/src/model.rs"
     contract = args.runtime_root / "duck-ipc-proto/src/lib.rs"
-    required = (mjcf, runtime, contract) + (
+    required = (mjcf, runtime, contract, args.demo_motion) + (
         (args.mouth_linkage,) if args.mouth_linkage is not None else ()
     )
     missing = [str(path) for path in required if not path.is_file()]
@@ -68,7 +74,12 @@ def build(args: argparse.Namespace) -> Path:
         args.mouth_linkage,
         joint_contract_path=contract,
     )
-    generate_microduck_scene(profile, mjcf, REPO_ROOT / "open_duck_tools")
+    generate_microduck_scene(
+        profile,
+        mjcf,
+        REPO_ROOT / "open_duck_tools",
+        demo_motion_path=args.demo_motion,
+    )
     manifest = bpy.data.texts.get("microduck-build-manifest.json") or bpy.data.texts.new(
         "microduck-build-manifest.json"
     )
