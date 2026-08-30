@@ -139,6 +139,15 @@ class MotionLoaderTests(unittest.TestCase):
                 with self.subTest(index=index), self.assertRaisesRegex(MotionError, message):
                     load_motion(self.write_archive(Path(directory), payload), profile)
 
+    def test_translates_corrupt_npz_to_motion_error(self):
+        profile = test_profile()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "corrupt.npz"
+            path.write_bytes(b"PK\x03\x04truncated")
+
+            with self.assertRaisesRegex(MotionError, "could not load motion archive"):
+                load_motion(path, profile)
+
 
 if __name__ == "__main__":
     unittest.main()

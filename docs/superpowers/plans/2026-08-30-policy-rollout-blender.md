@@ -136,7 +136,7 @@ previous action (14)
 command [vx, vy, wz, head(4)=0, body(6)=0] (13)
 ```
 
-Initialize the free root at `(0, 0, 0.125)` and the servo joints/control at `DEFAULT_POSE`. For each frame: call `mujoco.mj_forward`, record canonical joint/body state, infer one action, set `ctrl = DEFAULT_POSE + action`, then call `mujoco.mj_step` four times. Build with `build_motion_archive`, write to a temporary sibling, call `validate_motion`, then atomically replace the destination.
+Initialize the free root at `(0, 0, 0.125)` and the servo joints/control at `DEFAULT_POSE`. For each frame: call `mujoco.mj_forward`, record canonical joint/body state, infer one action, set `ctrl = DEFAULT_POSE + action * action_scale`, then call `mujoco.mj_step` four times. Build with `build_motion_archive`, write to a temporary sibling, call `validate_motion`, then atomically replace the destination.
 
 - [ ] **Step 7: Run rollout and validator tests**
 

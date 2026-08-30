@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import zipfile
 
 import numpy as np
 
@@ -121,7 +122,7 @@ def load_motion(path: str | Path, profile: RobotProfile) -> ImportedMotion:
             loaded = {name: archive[name].copy() for name in _NATIVE_KEYS}
     except MotionError:
         raise
-    except (OSError, ValueError, KeyError) as exc:
+    except (OSError, ValueError, KeyError, zipfile.BadZipFile) as exc:
         raise MotionError(f"could not load motion archive: {exc}") from exc
 
     _scalar(loaded["fps"], "fps", 50)
