@@ -13,9 +13,9 @@ SPEC.loader.exec_module(MODULE)
 
 
 class BuildCliTests(unittest.TestCase):
-    def test_requires_authorized_mouth_linkage_argument(self):
-        with self.assertRaises(SystemExit):
-            MODULE._arguments([])
+    def test_defaults_to_explicit_approximate_mouth_mode(self):
+        args = MODULE._arguments([])
+        self.assertIsNone(args.mouth_linkage)
 
     def test_reports_all_missing_canonical_sources_before_build(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -24,7 +24,6 @@ class BuildCliTests(unittest.TestCase):
                 [
                     "--rl-root", str(root / "rl"),
                     "--runtime-root", str(root / "runtime"),
-                    "--mouth-linkage", str(root / "mouth.json"),
                 ]
             )
             with self.assertRaisesRegex(ProfileError, "required source file"):

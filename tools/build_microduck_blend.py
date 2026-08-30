@@ -39,8 +39,7 @@ def _arguments(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--mouth-linkage",
         type=Path,
-        required=True,
-        help="authorized CAD/mates linkage JSON (required; not available publicly)",
+        help="authorized CAD/mates linkage JSON; omit for the image-derived approximate hinge",
     )
     parser.add_argument(
         "--output",
@@ -57,7 +56,9 @@ def build(args: argparse.Namespace) -> Path:
     )
     runtime = args.runtime_root / "duck-control/src/model.rs"
     contract = args.runtime_root / "duck-ipc-proto/src/lib.rs"
-    required = (mjcf, runtime, contract, args.mouth_linkage)
+    required = (mjcf, runtime, contract) + (
+        (args.mouth_linkage,) if args.mouth_linkage is not None else ()
+    )
     missing = [str(path) for path in required if not path.is_file()]
     if missing:
         raise ProfileError("required source file(s) missing: " + ", ".join(missing))
@@ -77,6 +78,9 @@ def build(args: argparse.Namespace) -> Path:
             {
                 "schema_version": 1,
                 "robot_id": profile.robot_id,
+                "mouth_mode": (
+                    "authorized-cad" if args.mouth_linkage is not None else "image-derived-approximation"
+                ),
                 "source_sha256": profile.source_sha256,
             },
             indent=2,

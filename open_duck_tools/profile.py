@@ -325,6 +325,46 @@ def load_mouth_linkage(path: str | Path) -> MouthLinkage:
     )
 
 
+def approximate_mouth_linkage() -> MouthLinkage:
+    """Return the versioned, image-derived single-hinge presentation rig."""
+    closed = math.radians(-5.0)
+    opened = math.radians(30.0)
+    pivot = (-0.0045, 0.0, -0.011)
+
+    def pose(angle_from_closed: float) -> Pose:
+        half = angle_from_closed / 2.0
+        return Pose(pivot, (math.cos(half), 0.0, math.sin(half), 0.0))
+
+    definition = {
+        "approximation_version": 1,
+        "basis": "squad.webp visual reference plus canonical jaw STL coordinate frame",
+        "pivot_m": pivot,
+        "axis": "jaw_soft local +Y",
+        "meshes": ["jaw", "jaw_soft", "bottom_head_shell"],
+    }
+    link = MouthLink(
+        "approximate_lower_beak",
+        ("jaw", "jaw_soft", "bottom_head_shell"),
+        "jaw_soft",
+    )
+    samples = (
+        MouthSample(closed, {link.name: pose(0.0)}),
+        MouthSample(opened, {link.name: pose(opened - closed)}),
+    )
+    midpoint = (closed + opened) / 2.0
+    return MouthLinkage(
+        1,
+        closed,
+        opened,
+        (link,),
+        samples,
+        (MouthSample(midpoint, {link.name: pose(midpoint - closed)}),),
+        hashlib.sha256(
+            json.dumps(definition, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest(),
+    )
+
+
 def _rust_array(text: str, name: str) -> str:
     match = re.search(rf"(?:pub\s+)?const\s+{name}\s*:[^=]+?=\s*\[(.*?)\];", text, re.S)
     if not match:
@@ -407,7 +447,7 @@ def _mjcf_contract(path: Path) -> tuple[list[BodySpec], list[JointSpec]]:
 def build_microduck_profile(
     mjcf_path: str | Path,
     runtime_model_path: str | Path,
-    mouth_linkage_path: str | Path,
+    mouth_linkage_path: str | Path | None,
     joint_contract_path: str | Path | None = None,
     *,
     expected_joint_count: int = 14,
@@ -435,11 +475,19 @@ def build_microduck_profile(
         raise ProfileError(
             f"runtime/MJCF joint order differs: runtime={policy_names}, mjcf={mjcf_names}"
         )
-    mouth = load_mouth_linkage(mouth_linkage_path)
+    mouth = (
+        load_mouth_linkage(mouth_linkage_path)
+        if mouth_linkage_path is not None
+        else approximate_mouth_linkage()
+    )
     hashes = {
         "mjcf": hashlib.sha256(mjcf_path.read_bytes()).hexdigest(),
         "runtime_model": hashlib.sha256(runtime_model_path.read_bytes()).hexdigest(),
-        "mouth_linkage": mouth.source_sha256,
+        (
+            "mouth_linkage"
+            if mouth_linkage_path is not None
+            else "mouth_linkage_approximation"
+        ): mouth.source_sha256,
     }
     if contract is not None:
         hashes["joint_contract"] = hashlib.sha256(contract.read_bytes()).hexdigest()

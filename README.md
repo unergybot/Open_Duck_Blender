@@ -143,17 +143,20 @@ Lavender/Sky colourways, and native `.npz` export for `microduck_rl`.
 The public MJCF/STLs do not contain the complete grasping-beak mechanism. The
 [official Microduck site](https://pollen-robotics.com/microduck/) describes an
 articulated beak, while its press kit states that the mechanical hardware is not
-open source. For that reason the generator requires an authorized CAD/mates
-export matching `assets/microduck/mouth-linkage.schema.json`; it never invents
-the missing linkage.
+open source. By default the generator therefore creates a clearly marked,
+image-derived single-hinge presentation rig. It is suitable for animation but
+not a mechanically validated grasp simulation. An authorized CAD/mates export
+matching `assets/microduck/mouth-linkage.schema.json` replaces the approximation.
 
 With `microduck`, `microduck_rl`, and this repository under `~/MyCode`:
 
 ```bash
 blender --background --factory-startup \
-  --python tools/build_microduck_blend.py -- \
-  --mouth-linkage /path/to/authorized-mouth-linkage.json
+  --python tools/build_microduck_blend.py
 ```
+
+Add `-- --mouth-linkage /path/to/authorized-mouth-linkage.json` when the
+authoritative package is available.
 
 This writes `microduck-alpha.blend`. Open it with automatic Python execution
 allowed, animate the selected armature, then use **Open Duck → Export mjlab
