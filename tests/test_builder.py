@@ -108,6 +108,7 @@ class SceneBuilderTests(unittest.TestCase):
         addon.unregister()
 
     def test_builds_profiled_rig_visual_and_driven_mouth_link(self):
+        bpy.context.scene.render.fps_base = 1.25
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "assets").mkdir()
@@ -125,6 +126,7 @@ class SceneBuilderTests(unittest.TestCase):
 
         self.assertEqual(armature.get("duck_robot_id"), "microduck-alpha")
         self.assertEqual(bpy.context.scene.render.fps, 50)
+        self.assertEqual(bpy.context.scene.render.fps_base, 1.0)
         self.assertEqual(
             set(profile.body_names),
             {bone.name for bone in armature.data.bones if not bone.name.startswith("mouth::")},

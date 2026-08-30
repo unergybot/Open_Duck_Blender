@@ -17,6 +17,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from open_duck_tools.builder import generate_microduck_scene
+from open_duck_tools.motion import MotionError
 from open_duck_tools.motion_import import import_motion_action
 from open_duck_tools.profile import ProfileError, build_microduck_profile
 
@@ -125,7 +126,7 @@ def main() -> int:
     argv = sys.argv[sys.argv.index("--") + 1 :] if "--" in sys.argv else []
     try:
         output = build(_arguments(argv))
-    except (ProfileError, OSError) as exc:
+    except (MotionError, ProfileError, OSError) as exc:
         print(f"Microduck build failed: {exc}", file=sys.stderr)
         return 2
     print(f"Saved {output}")

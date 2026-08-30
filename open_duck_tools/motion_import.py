@@ -56,8 +56,11 @@ def _array(value, field: str, shape: tuple[int, ...]) -> np.ndarray:
 
 
 def _names(value, field: str, expected: tuple[str, ...]) -> None:
+    array = np.asarray(value)
+    if array.ndim != 1:
+        raise MotionError(f"{field} must be a one-dimensional name array")
     try:
-        actual = tuple(str(item) for item in np.asarray(value).tolist())
+        actual = tuple(str(item) for item in array.tolist())
     except (TypeError, ValueError) as exc:
         raise MotionError(f"{field} must be a one-dimensional name array") from exc
     if actual == expected:
@@ -126,7 +129,13 @@ def load_motion(path: str | Path, profile: RobotProfile) -> ImportedMotion:
     _names(loaded["joint_names"], "joint_names", profile.joint_names)
     _names(loaded["body_names"], "body_names", profile.body_names)
     _validate_source_hashes(loaded["source_hashes_json"])
-    frames = int(np.asarray(loaded["joint_pos"]).shape[0])
+    joint_pos_shape = np.asarray(loaded["joint_pos"]).shape
+    if len(joint_pos_shape) != 2:
+        raise MotionError(
+            "joint_pos must have shape "
+            f"[T,{len(profile.joint_names)}], got {joint_pos_shape}"
+        )
+    frames = int(joint_pos_shape[0])
     if frames < 1:
         raise MotionError("joint_pos must contain at least one frame")
     joints = _array(loaded["joint_pos"], "joint_pos", (frames, len(profile.joint_names)))
@@ -197,9 +206,20 @@ def import_motion_action(armature, profile: RobotProfile, path: str | Path, *, a
     previous_matrix = armature.matrix_world.copy()
     previous_rotation_mode = armature.rotation_mode
     previous_pose = {
-        bone.name: (bone.rotation_mode, bone.rotation_euler.copy()) for bone in joint_bones
+        bone.name: (bone.rotation_mode, bone.matrix_basis.copy())
+        for bone in armature.pose.bones
     }
-    previous_scene = (scene.frame_start, scene.frame_end, scene.frame_current, scene.render.fps)
+    has_mouth_state = hasattr(armature, "duck_mouth_open")
+    previous_mouth_open = (
+        float(armature.duck_mouth_open) if has_mouth_state else None
+    )
+    previous_scene = (
+        scene.frame_start,
+        scene.frame_end,
+        scene.frame_current,
+        scene.render.fps,
+        scene.render.fps_base,
+    )
     action = None
     try:
         if animation_data is None:
@@ -209,6 +229,7 @@ def import_motion_action(armature, profile: RobotProfile, path: str | Path, *, a
         animation_data.action = action
         armature.rotation_mode = "QUATERNION"
         scene.render.fps = motion.fps
+        scene.render.fps_base = 1.0
         scene.frame_start = 1
         scene.frame_end = motion.frames
         for index in range(motion.frames):
@@ -236,14 +257,22 @@ def import_motion_action(armature, profile: RobotProfile, path: str | Path, *, a
             animation_data.action = previous_action
         elif armature.animation_data is not None:
             armature.animation_data_clear()
-        armature.matrix_world = previous_matrix
-        armature.rotation_mode = previous_rotation_mode
-        for bone in joint_bones:
-            rotation_mode, rotation_euler = previous_pose[bone.name]
-            bone.rotation_mode = rotation_mode
-            bone.rotation_euler = rotation_euler
-        scene.frame_start, scene.frame_end, current_frame, scene.render.fps = previous_scene
+        (
+            scene.frame_start,
+            scene.frame_end,
+            current_frame,
+            scene.render.fps,
+            scene.render.fps_base,
+        ) = previous_scene
         scene.frame_set(current_frame)
+        armature.rotation_mode = previous_rotation_mode
+        armature.matrix_world = previous_matrix
+        if has_mouth_state:
+            armature.duck_mouth_open = previous_mouth_open
+        for bone in armature.pose.bones:
+            rotation_mode, matrix_basis = previous_pose[bone.name]
+            bone.rotation_mode = rotation_mode
+            bone.matrix_basis = matrix_basis
         if action is not None and action.name in bpy.data.actions:
             bpy.data.actions.remove(action)
         if isinstance(exc, MotionError):

@@ -272,6 +272,7 @@ def generate_microduck_scene(
             collection.remove(item, do_unlink=True)
     scene = bpy.context.scene
     scene.render.fps = 50
+    scene.render.fps_base = 1.0
     scene.frame_start = 1
     scene.frame_end = 100
     scene.unit_settings.system = "METRIC"

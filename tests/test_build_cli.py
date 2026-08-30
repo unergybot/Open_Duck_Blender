@@ -1,17 +1,22 @@
+from contextlib import redirect_stderr
 import importlib.util
+import io
 import json
 import struct
+import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import bpy
 
+from open_duck_tools.motion import MotionError
 from open_duck_tools.profile import ProfileError
 
 
 SCRIPT = Path(__file__).parents[1] / "tools" / "build_microduck_blend.py"
-POLICY_SHA256 = "ffa9df070e15a2490b862a16e514fdb76ff8eb5ec1001f0dd3474350dce1aa62"
+POLICY_SHA256 = "822a1fbde45f31c7b703d09a225115f430672fd0ba4873d97201b35832348b54"
 JOINT_NAMES = (
     "left_hip_yaw",
     "left_hip_roll",
@@ -170,6 +175,7 @@ class BuildCliTests(unittest.TestCase):
                 (1.0, 200.0),
             )
             self.assertEqual(bpy.context.scene.render.fps, 50)
+            self.assertEqual(bpy.context.scene.render.fps_base, 1.0)
             self.assertEqual(
                 (bpy.context.scene.frame_start, bpy.context.scene.frame_end),
                 (1, 200),
@@ -195,6 +201,20 @@ class BuildCliTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ProfileError, "required source file"):
                 MODULE.build(args)
+
+    def test_main_reports_motion_error_concisely_without_traceback(self):
+        stderr = io.StringIO()
+        with mock.patch.object(
+            MODULE, "build", side_effect=MotionError("joint_pos must have shape [T,14]")
+        ), mock.patch.object(sys, "argv", ["blender", "--"]), redirect_stderr(stderr):
+            result = MODULE.main()
+
+        self.assertEqual(result, 2)
+        self.assertEqual(
+            stderr.getvalue(),
+            "Microduck build failed: joint_pos must have shape [T,14]\n",
+        )
+        self.assertNotIn("Traceback", stderr.getvalue())
 
 
 if __name__ == "__main__":

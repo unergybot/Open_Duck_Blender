@@ -212,7 +212,9 @@ active imported action again.
 `microduck-alpha.blend` ships with `Policy_alpha_walking_forward`, a
 deterministic 200-frame, 50 Hz action generated from `alpha_walking.onnx` with
 the forward command set to `0.30 m/s`. The action preserves simulated root
-motion and advances approximately `0.162 m` over four seconds.
+motion and advances approximately `0.487 m` over four seconds. The rollout uses
+four 5 ms MuJoCo substeps per frame and records a canonical configuration digest
+alongside the policy and scene hashes.
 
 | Frame 1 | Frame 100 | Frame 200 |
 | --- | --- | --- |

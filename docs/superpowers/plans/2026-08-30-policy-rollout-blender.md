@@ -14,12 +14,26 @@
 
 - Use `/home/mcao/MyCode/microduck/policies/alpha_walking.onnx` unchanged.
 - Generate 200 frames at exactly 50 Hz from a 4.0-second rollout.
-- Use command `(0.15, 0.0, 0.0)` and deterministic seed `0`.
+- Use command `(0.30, 0.0, 0.0)` and deterministic seed `0`.
 - Preserve exact 14-joint and 15-body canonical ordering; never silently reorder.
 - Keep the mouth visual-only and absent from the motion archive.
 - Do not add ONNX Runtime or MuJoCo to Blender.
 - Preserve `MicroduckCrouchTest` and add `Policy_alpha_walking_forward`.
 - All GitHub integration targets `unergybot` forks only.
+
+### Final-review amendment
+
+The user-approved `0.30 m/s` command supersedes the initial `0.15 m/s`
+proposal because the lower-command candidate did not meet the required
+`>0.1 m` forward-displacement gate. The corrected exporter must also set the
+MuJoCo timestep to `0.005 s`; four substeps then equal one `0.02 s` / 50 Hz
+control frame. Regenerated acceptance evidence at command `(0.30, 0.0, 0.0)`,
+duration `4.0`, and seed `0` contains 200 finite frames, advances
+`0.486906945705 m`, and has archive SHA-256
+`822a1fbde45f31c7b703d09a225115f430672fd0ba4873d97201b35832348b54`.
+The archive must also contain canonical rollout-configuration SHA-256
+`eb7e3697bc1f166a458a080867f9fcf02f5c8005a404430a06b1437eb7187298`,
+covering command, duration, seed, timestep, decimation, and control rate.
 
 ---
 
@@ -85,7 +99,7 @@ class PolicyRolloutConfig:
     policy_path: Path
     output_path: Path
     duration_s: float = 4.0
-    command: tuple[float, float, float] = (0.15, 0.0, 0.0)
+    command: tuple[float, float, float] = (0.30, 0.0, 0.0)
     seed: int = 0
 ```
 
@@ -184,7 +198,7 @@ uv run scripts/export_policy_rollout.py \
   /home/mcao/MyCode/microduck/policies/alpha_walking.onnx \
   --output /tmp/alpha-walking-forward.npz \
   --duration 4 \
-  --lin-vel-x 0.15 \
+  --lin-vel-x 0.30 \
   --seed 0
 uv run scripts/validate_blender_motion.py /tmp/alpha-walking-forward.npz
 ```

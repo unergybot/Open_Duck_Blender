@@ -10,11 +10,28 @@ edited, and rendered.
 The first milestone uses:
 
 - policy: `~/MyCode/microduck/policies/alpha_walking.onnx`
-- command: `(0.15, 0.0, 0.0)` for forward, lateral, and yaw velocity
+- command: `(0.30, 0.0, 0.0)` for forward, lateral, and yaw velocity
 - duration: 4.0 seconds
 - control rate: 50 Hz
 - output frames: 200
 - Blender action: `Policy_alpha_walking_forward`
+
+## Approved Milestone Amendment
+
+The user-approved `0.30 m/s` forward command supersedes the original `0.15 m/s`
+proposal after the lower-command candidate failed the milestone's required
+`>0.1 m` forward-displacement gate. Final-review diagnosis also found that the
+scene's inherited 2 ms timestep made four substeps advance only 8 ms while the
+archive was labelled 50 Hz. The authoritative rollout therefore sets the MuJoCo
+timestep to 5 ms and advances four substeps per sample, for an exact 20 ms
+control interval.
+
+Evidence regenerated with the corrected clock, command `(0.30, 0.0, 0.0)`,
+duration `4.0`, and seed `0` contains 200 finite frames, advances
+`0.486906945705 m`, and has archive SHA-256
+`822a1fbde45f31c7b703d09a225115f430672fd0ba4873d97201b35832348b54`.
+Its canonical rollout-configuration SHA-256 is
+`eb7e3697bc1f166a458a080867f9fcf02f5c8005a404430a06b1437eb7187298`.
 
 ## Repository Boundaries
 
@@ -40,7 +57,7 @@ and action semantics as `scripts/infer_policy.py`:
 - projected gravity rather than raw accelerometer
 - unified 61-value observation with 13 command values
 - action target `DEFAULT_POSE + action * action_scale`
-- four MuJoCo substeps per 50 Hz policy step
+- a 5 ms MuJoCo timestep and four substeps per 50 Hz policy step
 
 The package boundary will expose a typed configuration and one function:
 
@@ -50,7 +67,7 @@ class PolicyRolloutConfig:
     policy_path: Path
     output_path: Path
     duration_s: float = 4.0
-    command: tuple[float, float, float] = (0.15, 0.0, 0.0)
+    command: tuple[float, float, float] = (0.30, 0.0, 0.0)
     seed: int = 0
 
 def export_policy_rollout(config: PolicyRolloutConfig) -> Path:
@@ -64,7 +81,7 @@ uv run scripts/export_policy_rollout.py \
   ~/MyCode/microduck/policies/alpha_walking.onnx \
   --output /tmp/alpha-walking-forward.npz \
   --duration 4 \
-  --lin-vel-x 0.15 \
+  --lin-vel-x 0.30 \
   --seed 0
 ```
 
@@ -73,7 +90,9 @@ frames. Each frame contains joint positions and canonical body transforms in
 the same 14-joint/15-body order already enforced by
 `mjlab_microduck.blender_motion`. It writes the existing motion schema with a
 50 Hz rate, source hashes, and additional provenance encoded in
-`source_hashes_json`: policy SHA-256 plus rollout configuration SHA-256.
+`source_hashes_json`: policy SHA-256 plus a rollout-configuration SHA-256 over
+canonical compact JSON containing command, duration, seed, timestep,
+decimation, and control rate.
 
 Before returning, the exporter calls the existing MuJoCo motion validator on
 its own output. A failed validation removes no existing user file: generation
@@ -125,7 +144,7 @@ pose rather than double-applying the MJCF rest transform. Location and WXYZ
 quaternion channels are keyed on the armature object. Quaternion signs are made
 continuous before keying to prevent long-path interpolation.
 
-The importer sets the scene to 50 Hz and the imported frame range. It leaves
+The importer sets the scene to 50 Hz with `fps_base=1.0` and the imported frame range. It leaves
 `duck_mouth_open` unchanged because the mouth is outside the policy and motion
 archive.
 
@@ -150,7 +169,8 @@ The milestone artifact will import the generated walk into the tracked
 
 The rollout CLI rejects missing policies, incompatible ONNX input/output
 shapes, missing 14-joint metadata, non-finite commands, nonpositive duration,
-and durations that do not resolve to an integral number of 50 Hz frames.
+durations that do not resolve to an integral number of 50 Hz frames, output
+paths without a `.npz` suffix, and any output that resolves to the policy input.
 
 The Blender importer translates NPZ, schema, profile, and Blender action errors
 into `MotionError` or `ProfileError`. Validation is side-effect-free. Scene

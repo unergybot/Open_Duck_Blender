@@ -124,6 +124,15 @@ class MotionLoaderTests(unittest.TestCase):
         over_limit = archive_payload(profile)
         over_limit["joint_pos"][1, 1] = 0.75
         cases.append((over_limit, r"joint_pos.*frame 1.*index 1.*knee"))
+        scalar_joint_pos = archive_payload(profile)
+        scalar_joint_pos["joint_pos"] = np.array(0.0)
+        cases.append((scalar_joint_pos, r"joint_pos.*shape"))
+        vector_joint_pos = archive_payload(profile)
+        vector_joint_pos["joint_pos"] = np.array([0.0, 0.0])
+        cases.append((vector_joint_pos, r"joint_pos.*shape"))
+        matrix_joint_names = archive_payload(profile)
+        matrix_joint_names["joint_names"] = np.array([["hip", "knee"]])
+        cases.append((matrix_joint_names, r"joint_names.*one-dimensional"))
 
         with tempfile.TemporaryDirectory() as directory:
             for index, (payload, message) in enumerate(cases):
@@ -190,6 +199,7 @@ class MotionActionTests(unittest.TestCase):
             return import_motion_action(self.armature, self.profile, path, action_name=action_name)
 
     def test_imports_calibrated_root_and_joint_keys_into_fake_user_action(self):
+        bpy.context.scene.render.fps_base = 1.25
         action = self.import_action()
         scene = bpy.context.scene
         pose_bone = self.armature.pose.bones["hip_link"]
@@ -197,6 +207,7 @@ class MotionActionTests(unittest.TestCase):
         self.assertEqual(action.name, "Walk")
         self.assertTrue(action.use_fake_user)
         self.assertEqual((scene.frame_start, scene.frame_end), (1, 3))
+        self.assertEqual((scene.render.fps, scene.render.fps_base), (50, 1.0))
         scene.frame_set(3)
         assert_vector_close(self, self.armature.location, (2.0, 2.0, 2.875))
         assert_quaternion_close(self, self.armature.rotation_quaternion, (0.0, 0.0, 0.0, 1.0))
@@ -232,6 +243,98 @@ class MotionActionTests(unittest.TestCase):
         assert_quaternion_close(self, self.armature.rotation_quaternion, (0.5, 0.5, 0.5, 0.5))
         self.assertAlmostEqual(pose_bone.rotation_euler.z, 0.2, places=6)
         self.assertIsNone(bpy.data.actions.get("Broken"))
+
+    def test_restores_keyed_action_and_unkeyed_overrides_after_keying_fails(self):
+        scene = bpy.context.scene
+        created_mouth_property = not hasattr(bpy.types.Object, "duck_mouth_open")
+        if created_mouth_property:
+            bpy.types.Object.duck_mouth_open = bpy.props.FloatProperty(default=0.0)
+            self.addCleanup(delattr, bpy.types.Object, "duck_mouth_open")
+
+        bpy.context.view_layer.objects.active = self.armature
+        bpy.ops.object.mode_set(mode="EDIT")
+        mouth_edit_bone = self.armature.data.edit_bones.new("mouth::lower_beak")
+        mouth_edit_bone.parent = self.armature.data.edit_bones["root"]
+        mouth_edit_bone.matrix = Matrix.Translation((0.0, 0.0, 0.2))
+        mouth_edit_bone.length = 0.01
+        bpy.ops.object.mode_set(mode="OBJECT")
+
+        prior = bpy.data.actions.new("PriorKeyed")
+        self.armature.animation_data_create()
+        self.armature.animation_data.action = prior
+        hip = self.armature.pose.bones["hip_link"]
+        mouth = self.armature.pose.bones["mouth::lower_beak"]
+
+        self.armature.location = (1.0, 2.0, 3.0)
+        self.armature.keyframe_insert(data_path="location", frame=7)
+        self.armature.location = (5.0, 6.0, 7.0)
+        self.armature.keyframe_insert(data_path="location", frame=9)
+        hip.rotation_mode = "XYZ"
+        hip.rotation_euler.z = 0.1
+        hip.keyframe_insert(data_path="rotation_euler", index=2, frame=7)
+        hip.rotation_euler.z = 0.9
+        hip.keyframe_insert(data_path="rotation_euler", index=2, frame=9)
+        mouth.location = (0.01, 0.0, 0.0)
+        mouth.keyframe_insert(data_path="location", frame=7)
+        mouth.location = (0.03, 0.0, 0.0)
+        mouth.keyframe_insert(data_path="location", frame=9)
+        self.armature.duck_mouth_open = 0.1
+        self.armature.keyframe_insert(data_path="duck_mouth_open", frame=7)
+        self.armature.duck_mouth_open = 0.9
+        self.armature.keyframe_insert(data_path="duck_mouth_open", frame=9)
+
+        scene.frame_start, scene.frame_end = 7, 9
+        scene.render.fps = 23
+        scene.render.fps_base = 1.001
+        scene.frame_set(8)
+        self.armature.rotation_mode = "QUATERNION"
+        self.armature.matrix_world = Matrix.Translation((9.0, 8.0, 7.0)) @ Quaternion(
+            (0.9238795, 0.0, 0.3826834, 0.0)
+        ).to_matrix().to_4x4()
+        hip.rotation_mode = "ZYX"
+        hip.matrix_basis = Matrix.Translation((0.01, 0.02, 0.03)) @ Quaternion(
+            (0.9659258, 0.2588190, 0.0, 0.0)
+        ).to_matrix().to_4x4()
+        mouth.rotation_mode = "AXIS_ANGLE"
+        mouth.matrix_basis = Matrix.Translation((0.04, 0.05, 0.06)) @ Quaternion(
+            (0.9848078, 0.0, 0.0, 0.1736482)
+        ).to_matrix().to_4x4()
+        self.armature.duck_mouth_open = 0.73
+        expected_matrix = self.armature.matrix_world.copy()
+        expected_hip_basis = hip.matrix_basis.copy()
+        expected_mouth_basis = mouth.matrix_basis.copy()
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = MotionLoaderTests().write_archive(
+                Path(directory), action_payload(self.profile)
+            )
+            with mock.patch.object(
+                type(hip), "keyframe_insert", side_effect=RuntimeError("injected")
+            ):
+                with self.assertRaisesRegex(MotionError, "injected"):
+                    import_motion_action(
+                        self.armature, self.profile, path, action_name="BrokenKeyed"
+                    )
+
+        self.assertIs(self.armature.animation_data.action, prior)
+        self.assertEqual(
+            (
+                scene.frame_start,
+                scene.frame_end,
+                scene.frame_current,
+                scene.render.fps,
+            ),
+            (7, 9, 8, 23),
+        )
+        self.assertAlmostEqual(scene.render.fps_base, 1.001, places=6)
+        np.testing.assert_allclose(self.armature.matrix_world, expected_matrix, atol=1e-6)
+        self.assertEqual(self.armature.rotation_mode, "QUATERNION")
+        np.testing.assert_allclose(hip.matrix_basis, expected_hip_basis, atol=1e-6)
+        self.assertEqual(hip.rotation_mode, "ZYX")
+        np.testing.assert_allclose(mouth.matrix_basis, expected_mouth_basis, atol=1e-6)
+        self.assertEqual(mouth.rotation_mode, "AXIS_ANGLE")
+        self.assertAlmostEqual(self.armature.duck_mouth_open, 0.73, places=6)
+        self.assertIsNone(bpy.data.actions.get("BrokenKeyed"))
 
     def test_removes_new_animation_data_when_keying_fails_without_prior_animation(self):
         self.assertIsNone(self.armature.animation_data)
