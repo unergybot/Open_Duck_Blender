@@ -88,14 +88,24 @@ Work in the Blender repair worktree.
 - Add failing evaluated-rig tests showing the old arbitrary ankle-tail endpoint,
   off-axis leg rotation, missing limits, FK/IK playback corruption, and pose
   jumps.
+- Extend the embedded profile with normalized `left_foot` and `right_foot`
+  `SiteSpec` records parsed exactly once from the MJCF ankle bodies; bump the
+  profile schema while retaining a clear error for older profiles that lack the
+  physical IK contract.
 - Keep canonical body/FK bones authoritative. Add a separate helper/control
   chain within `MicroduckRig` for each leg, rooted below the FK hip-yaw body and
   built from exact hip-roll, hip-pitch, knee, ankle, and named MJCF foot-site
   pivots. Use locked offset helpers where a pivot displacement has a component
   along a hinge axis; only hinge controls carry a canonical DOF.
-- Add foot and pole controls. Constrain each hinge to its MJCF range, target the
-  canonical foot site rather than a display-bone tail, and map solved hinge
-  angles onto canonical local-Z rotations only while IK mode is active.
+- Add foot and pole controls plus one keyframeable sagittal foot-pitch channel;
+  do not expose an unsatisfiable arbitrary 3-axis foot rotation. Solve the four
+  bounded hinge angles with exact MJCF forward kinematics and a projected,
+  damped least-squares solver using an analytic position Jacobian, deterministic
+  fallback seeds, joint clamping, and the pole only as a branch selector. Map
+  solved hinge angles onto canonical local-Z rotations only while IK is active.
+- Use a guarded dependency-graph/frame-change update path for moved or keyed
+  controls. Mark unreachable targets clamped while retaining the best finite
+  bounded solution; never introduce off-axis motion to reduce target error.
 - Lock canonical joint location/scale/non-Z rotation; lock the canonical body
   root and make armature-object motion the sole floating-base control. Protect
   property-driven mouth helpers.
