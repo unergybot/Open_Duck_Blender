@@ -1,6 +1,8 @@
+import math
 import unittest
 from pathlib import Path
 import tempfile
+from unittest import mock
 
 import bpy
 import numpy as np
@@ -22,6 +24,14 @@ def play_once_handlers():
         handler
         for handler in bpy.app.handlers.frame_change_post
         if getattr(handler, "_duck_play_once_handler", False)
+    ]
+
+
+def native_playback_cleanup_handlers():
+    return [
+        handler
+        for handler in bpy.app.handlers.animation_playback_post
+        if getattr(handler, "_duck_native_playback_handler", False)
     ]
 
 
@@ -208,6 +218,44 @@ class MotionExportTests(unittest.TestCase):
 
         self.assertEqual(scene.frame_current, 17)
 
+    def test_rejects_non_finite_evaluated_matrix_instead_of_canonicalizing_it(self):
+        scene = bpy.context.scene
+        scene.frame_set(1)
+        matrices = addon._evaluated_body_matrices(
+            self.armature, self.profile.body_names
+        )
+        matrices["knee_link"] = matrices["knee_link"].copy()
+        matrices["knee_link"][0][0] = math.nan
+        scene.frame_set(17)
+
+        with mock.patch.object(
+            addon, "_evaluated_body_matrices", return_value=matrices
+        ):
+            with self.assertRaisesRegex(
+                MotionError, r"frame 1.*knee_link.*affine residual"
+            ):
+                addon.collect_armature_motion(self.armature, self.profile, 1, 1)
+
+        self.assertEqual(scene.frame_current, 17)
+
+    def test_restores_frame_and_subframe_after_success_and_failure(self):
+        scene = bpy.context.scene
+        scene.frame_set(2, subframe=0.5)
+        addon.collect_armature_motion(self.armature, self.profile, 1, 3)
+        self.assertEqual(scene.frame_current, 2)
+        self.assertAlmostEqual(scene.frame_subframe, 0.5, places=7)
+
+        hip = self.armature.pose.bones["hip_link"]
+        for frame, angle in ((1, 0.0), (2, 0.02), (3, 0.0)):
+            scene.frame_set(frame)
+            hip.rotation_euler.x = angle
+            hip.keyframe_insert(data_path="rotation_euler", index=0, frame=frame)
+        scene.frame_set(2, subframe=0.5)
+        with self.assertRaisesRegex(MotionError, r"rotation residual"):
+            addon.collect_armature_motion(self.armature, self.profile, 1, 3)
+        self.assertEqual(scene.frame_current, 2)
+        self.assertAlmostEqual(scene.frame_subframe, 0.5, places=7)
+
 
 class AnimationControlTests(unittest.TestCase):
     def setUp(self):
@@ -268,6 +316,39 @@ class AnimationControlTests(unittest.TestCase):
         self.assertEqual(bpy.ops.duck.toggle_animation(), {"FINISHED"})
         self.assertEqual(constraint.influence, 0.0)
         self.assertEqual(self.armature["fk_ik"], 0.0)
+
+    def test_selection_play_and_reset_clear_unkeyed_canonical_pose_contamination(self):
+        root = self.armature.pose.bones["root"]
+        hip = self.armature.pose.bones["hip_link"]
+        knee = self.armature.pose.bones["knee_link"]
+
+        def contaminate():
+            root.location.x = 0.05
+            hip.rotation_euler.x = 0.2
+            hip.location.y = 0.03
+            knee.scale.y = 1.2
+
+        def assert_canonical():
+            for bone_name in self.profile.body_names:
+                np.testing.assert_allclose(
+                    self.armature.pose.bones[bone_name].matrix_basis,
+                    Matrix.Identity(4),
+                    atol=1e-6,
+                    err_msg=bone_name,
+                )
+
+        contaminate()
+        self.armature.duck_action_name = self.walk.name
+        assert_canonical()
+
+        contaminate()
+        self.assertEqual(bpy.ops.duck.toggle_animation(), {"FINISHED"})
+        assert_canonical()
+        self.assertEqual(bpy.ops.duck.toggle_animation(), {"FINISHED"})
+
+        contaminate()
+        self.assertEqual(bpy.ops.duck.reset_animation(), {"FINISHED"})
+        assert_canonical()
 
     def test_retained_crouch_action_is_searchable_but_not_a_beginner_preset(self):
         self.assertTrue(hasattr(addon, "BEGINNER_ACTION_PRESETS"))
@@ -346,6 +427,36 @@ class AnimationControlTests(unittest.TestCase):
 
         self.assertEqual(scene.playback_loop_mode, "STOP_END_FRAME")
         self.assertEqual(play_once_handlers(), [])
+
+    @unittest.skipUnless(
+        hasattr(bpy.context.scene, "playback_loop_mode"),
+        "Blender 5.2+ playback loop API",
+    )
+    def test_blender_5_2_restores_native_loop_mode_on_every_terminal_path(self):
+        scene = bpy.context.scene
+        scene.playback_loop_mode = "BOUNCE"
+        self.armature.duck_action_name = self.walk.name
+
+        self.assertEqual(bpy.ops.duck.toggle_animation(), {"FINISHED"})
+        self.assertEqual(scene.playback_loop_mode, "STOP_END_FRAME")
+        self.assertEqual(len(native_playback_cleanup_handlers()), 1)
+        self.assertEqual(bpy.ops.duck.toggle_animation(), {"FINISHED"})
+        self.assertEqual(scene.playback_loop_mode, "BOUNCE")
+        self.assertEqual(native_playback_cleanup_handlers(), [])
+
+        self.assertEqual(bpy.ops.duck.toggle_animation(), {"FINISHED"})
+        cleanup = native_playback_cleanup_handlers()
+        self.assertEqual(len(cleanup), 1)
+        cleanup[0](scene, None)
+        self.assertEqual(scene.playback_loop_mode, "BOUNCE")
+        self.assertEqual(native_playback_cleanup_handlers(), [])
+
+        if bpy.context.screen.is_animation_playing:
+            bpy.ops.screen.animation_cancel(restore_frame=False)
+        self.assertEqual(bpy.ops.duck.toggle_animation(), {"FINISHED"})
+        self.assertEqual(bpy.ops.duck.reset_animation(), {"FINISHED"})
+        self.assertEqual(scene.playback_loop_mode, "BOUNCE")
+        self.assertEqual(native_playback_cleanup_handlers(), [])
 
     @unittest.skipIf(
         hasattr(bpy.context.scene, "playback_loop_mode"),

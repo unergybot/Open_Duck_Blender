@@ -101,6 +101,15 @@ class BlenderBridgeTests(unittest.TestCase):
         _, _, scaled_affine = blender_bridge.matrix_residual(scaled, expected)
         self.assertGreater(scaled_affine, 9e-4)
 
+    def test_matrix_residual_fails_closed_for_non_finite_matrices(self):
+        expected = Matrix.Identity(4)
+        for value in (math.nan, math.inf, -math.inf):
+            with self.subTest(value=value):
+                actual = Matrix.Identity(4)
+                actual[0][0] = value
+                residuals = blender_bridge.matrix_residual(actual, expected)
+                self.assertEqual(residuals, (math.inf, math.inf, math.inf))
+
 
 if __name__ == "__main__":
     unittest.main()

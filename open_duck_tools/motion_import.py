@@ -263,7 +263,7 @@ def import_motion_action(
     from mathutils import Matrix, Quaternion
     import bpy
 
-    from .blender_bridge import force_fk
+    from .blender_bridge import force_fk, reset_canonical_pose
 
     motion = load_motion(path, profile)
     joint_bones = []
@@ -300,6 +300,7 @@ def import_motion_action(
         scene.frame_start,
         scene.frame_end,
         scene.frame_current,
+        scene.frame_subframe,
         scene.render.fps,
         scene.render.fps_base,
     )
@@ -326,12 +327,15 @@ def import_motion_action(
         action["duck_source_sha256"] = motion.source_sha256
         action["duck_loopable"] = False
         force_fk(armature)
+        reset_canonical_pose(armature, profile)
         animation_data.action = action
         armature.rotation_mode = "QUATERNION"
         scene.render.fps = motion.fps
         scene.render.fps_base = 1.0
         scene.frame_start = 1
         scene.frame_end = motion.frames
+        joint_by_child = {joint.child_body: joint for joint in profile.joints}
+        previous_root_quaternion = None
         for index in range(motion.frames):
             frame = index + 1
             scene.frame_set(frame)
@@ -340,15 +344,38 @@ def import_motion_action(
                 @ Quaternion(motion.root_quat_wxyz[index]).to_matrix().to_4x4()
             )
             armature.matrix_world = desired_root_world @ root_mjcf_rest.inverted_safe()
+            root_quaternion = armature.rotation_quaternion.copy()
+            root_quaternion.normalize()
+            if (
+                previous_root_quaternion is not None
+                and previous_root_quaternion.dot(root_quaternion) < 0.0
+            ):
+                root_quaternion.negate()
+            armature.rotation_quaternion = root_quaternion
+            previous_root_quaternion = root_quaternion.copy()
             armature.keyframe_insert(data_path="location", frame=frame, group="root")
             armature.keyframe_insert(
                 data_path="rotation_quaternion", frame=frame, group="root"
             )
-            for joint, bone, angle in zip(profile.joints, joint_bones, motion.joint_pos[index]):
-                bone.rotation_mode = "XYZ"
+            reset_canonical_pose(armature, profile)
+            for joint, bone, angle in zip(
+                profile.joints, joint_bones, motion.joint_pos[index]
+            ):
                 bone.rotation_euler.z = float(angle)
+            for body_name in profile.body_names:
+                bone = armature.pose.bones[body_name]
+                group = joint_by_child.get(body_name)
+                group_name = group.name if group is not None else body_name
+                bone.keyframe_insert(data_path="location", frame=frame, group=group_name)
+                bone.keyframe_insert(data_path="scale", frame=frame, group=group_name)
                 bone.keyframe_insert(
-                    data_path="rotation_euler", index=2, frame=frame, group=joint.name
+                    data_path=(
+                        "rotation_euler"
+                        if body_name in joint_by_child
+                        else "rotation_quaternion"
+                    ),
+                    frame=frame,
+                    group=group_name,
                 )
         for fcurve in _action_fcurves(action):
             for keyframe in fcurve.keyframe_points:
@@ -364,10 +391,11 @@ def import_motion_action(
             scene.frame_start,
             scene.frame_end,
             current_frame,
+            current_subframe,
             scene.render.fps,
             scene.render.fps_base,
         ) = previous_scene
-        scene.frame_set(current_frame)
+        scene.frame_set(current_frame, subframe=current_subframe)
         armature.rotation_mode = previous_rotation_mode
         armature.matrix_world = previous_matrix
         if has_mouth_state:

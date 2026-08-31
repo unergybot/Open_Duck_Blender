@@ -335,6 +335,75 @@ class MotionActionTests(unittest.TestCase):
             {"LINEAR"},
         )
 
+    def test_import_preserves_root_quaternion_sign_continuity_across_180_degrees(self):
+        payload = action_payload(self.profile)
+        root_angles = tuple(math.radians(value) for value in (170.0, 190.0, 210.0))
+        for frame, root_angle in enumerate(root_angles):
+            hip_angle = root_angle + float(payload["joint_pos"][frame, 0])
+            knee_angle = hip_angle + float(payload["joint_pos"][frame, 1])
+            for body_index, angle in enumerate((root_angle, hip_angle, knee_angle)):
+                payload["body_quat_w"][frame, body_index] = (
+                    math.cos(angle / 2.0),
+                    0.0,
+                    0.0,
+                    math.sin(angle / 2.0),
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = MotionLoaderTests().write_archive(Path(directory), payload)
+            action = import_motion_action(
+                self.armature, self.profile, path, action_name="Crosses180"
+            )
+
+        curves = {
+            curve.array_index: curve
+            for curve in action_fcurves(action)
+            if curve.data_path == "rotation_quaternion"
+        }
+        keyed = []
+        for frame in (1.0, 2.0, 3.0):
+            keyed.append(
+                Quaternion(tuple(curves[index].evaluate(frame) for index in range(4)))
+            )
+        self.assertGreater(keyed[0].dot(keyed[1]), 0.0)
+        self.assertGreater(keyed[1].dot(keyed[2]), 0.0)
+
+        bpy.context.scene.frame_set(1, subframe=0.5)
+        expected = Quaternion((0.0, 0.0, 0.0, 1.0))
+        self.assertLess(
+            self.armature.rotation_quaternion.rotation_difference(expected).angle,
+            1e-4,
+        )
+
+    def test_import_clears_and_keys_every_canonical_pose_channel(self):
+        root = self.armature.pose.bones["root"]
+        hip = self.armature.pose.bones["hip_link"]
+        knee = self.armature.pose.bones["knee_link"]
+        root.location.x = 0.05
+        hip.rotation_euler.x = 0.2
+        hip.location.y = 0.03
+        knee.scale.y = 1.2
+
+        action = self.import_action("CanonicalPose")
+        bpy.context.scene.frame_set(1)
+
+        for bone_name in self.profile.body_names:
+            np.testing.assert_allclose(
+                self.armature.pose.bones[bone_name].matrix_basis,
+                Matrix.Identity(4),
+                atol=1e-6,
+                err_msg=bone_name,
+            )
+        paths = {curve.data_path for curve in action_fcurves(action)}
+        for bone_name in self.profile.body_names:
+            prefix = f'pose.bones["{bone_name}"]'
+            self.assertIn(f"{prefix}.location", paths)
+            self.assertIn(f"{prefix}.scale", paths)
+            self.assertTrue(
+                f"{prefix}.rotation_euler" in paths
+                or f"{prefix}.rotation_quaternion" in paths
+            )
+
     def _add_ik_constraint(self, influence=0.75):
         constraint = self.armature.pose.bones["knee_link"].constraints.new(
             "COPY_LOCATION"

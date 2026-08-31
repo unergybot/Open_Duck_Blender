@@ -18,6 +18,7 @@ from .blender_bridge import (
     force_fk,
     joint_angles_from_body_matrices,
     matrix_residual,
+    reset_canonical_pose,
 )
 from .motion import MotionError, build_motion_archive, save_motion_npz
 from .motion_import import import_motion_action
@@ -90,6 +91,7 @@ def collect_armature_motion(
             "Microduck motion export requires 50 Hz"
         )
     original_frame = scene.frame_current
+    original_subframe = scene.frame_subframe
     joint_frames = []
     body_positions = []
     body_quaternions = []
@@ -134,7 +136,7 @@ def collect_armature_motion(
             body_positions.append(positions)
             body_quaternions.append(quaternions)
     finally:
-        scene.frame_set(original_frame)
+        scene.frame_set(original_frame, subframe=original_subframe)
     return build_motion_archive(
         np.asarray(joint_frames),
         np.asarray(body_positions),
@@ -304,12 +306,33 @@ def _clear_play_once_handlers(scene=None) -> None:
         bpy.app.handlers.frame_change_post.remove(handler)
 
 
+def _clear_native_playback_handlers(scene=None) -> None:
+    scene_pointer = scene.as_pointer() if scene is not None else None
+    for handler in tuple(bpy.app.handlers.animation_playback_post):
+        if not getattr(handler, "_duck_native_playback_handler", False):
+            continue
+        if scene_pointer is not None and getattr(
+            handler, "_duck_scene_pointer", None
+        ) != scene_pointer:
+            continue
+        bpy.app.handlers.animation_playback_post.remove(handler)
+        target_scene = getattr(handler, "_duck_scene", None)
+        previous_mode = getattr(handler, "_duck_previous_loop_mode", None)
+        if (
+            target_scene is not None
+            and previous_mode is not None
+            and hasattr(target_scene, "playback_loop_mode")
+        ):
+            target_scene.playback_loop_mode = previous_mode
+
+
 def _stop_playback(context) -> None:
     screen = getattr(context, "screen", None)
     if screen is not None and screen.is_animation_playing:
         bpy.ops.screen.animation_cancel(restore_frame=False)
     scene = getattr(context, "scene", None)
     _clear_play_once_handlers(scene)
+    _clear_native_playback_handlers(scene)
 
 
 def _action_range(action) -> tuple[int, int]:
@@ -352,9 +375,26 @@ def _install_play_once_handler(scene) -> None:
     bpy.app.handlers.frame_change_post.append(stop_at_end)
 
 
+def _install_native_playback_cleanup(scene) -> None:
+    _clear_native_playback_handlers(scene)
+    scene_pointer = scene.as_pointer()
+    previous_mode = scene.playback_loop_mode
+
+    def restore_after_playback(changed_scene, *_args):
+        if changed_scene.as_pointer() == scene_pointer:
+            _clear_native_playback_handlers(changed_scene)
+
+    restore_after_playback._duck_native_playback_handler = True
+    restore_after_playback._duck_scene_pointer = scene_pointer
+    restore_after_playback._duck_scene = scene
+    restore_after_playback._duck_previous_loop_mode = previous_mode
+    bpy.app.handlers.animation_playback_post.append(restore_after_playback)
+
+
 def _configure_action_playback(scene, action) -> None:
     _clear_play_once_handlers(scene)
     if hasattr(scene, "playback_loop_mode"):
+        _install_native_playback_cleanup(scene)
         scene.playback_loop_mode = (
             "INFINITE" if _is_loopable(action) else "STOP_END_FRAME"
         )
@@ -365,6 +405,7 @@ def _configure_action_playback(scene, action) -> None:
 def _activate_action(armature, action, scene) -> None:
     force_fk(armature)
     _stop_playback(bpy.context)
+    reset_canonical_pose(armature, profile_from_armature(armature))
     armature.animation_data_create()
     armature.animation_data.action = action
     start, _end = _set_action_scene_range(scene, action)
@@ -421,9 +462,15 @@ class DUCK_OT_toggle_animation(bpy.types.Operator):
         else:
             action = armature.animation_data.action
             force_fk(armature)
+            reset_canonical_pose(armature, profile_from_armature(armature))
             start, end = _set_action_scene_range(context.scene, action)
             if context.scene.frame_current < start or context.scene.frame_current >= end:
                 context.scene.frame_set(start)
+            else:
+                context.scene.frame_set(
+                    context.scene.frame_current,
+                    subframe=context.scene.frame_subframe,
+                )
             _configure_action_playback(context.scene, action)
             bpy.ops.screen.animation_play()
         return {"FINISHED"}
@@ -443,6 +490,7 @@ class DUCK_OT_reset_animation(bpy.types.Operator):
         )
         if action is not None:
             force_fk(armature)
+            reset_canonical_pose(armature, profile_from_armature(armature))
             start, _end = _set_action_scene_range(context.scene, action)
         else:
             start = context.scene.frame_start
@@ -588,6 +636,7 @@ CLASSES = (
 
 def register():
     _clear_play_once_handlers()
+    _clear_native_playback_handlers()
     for cls in CLASSES:
         if not hasattr(bpy.types, cls.__name__):
             bpy.utils.register_class(cls)
@@ -617,6 +666,7 @@ def register():
 def unregister():
     _stop_playback(bpy.context)
     _clear_play_once_handlers()
+    _clear_native_playback_handlers()
     if hasattr(bpy.types.Object, "duck_action_name"):
         del bpy.types.Object.duck_action_name
     if hasattr(bpy.types.Object, "duck_mouth_open"):
