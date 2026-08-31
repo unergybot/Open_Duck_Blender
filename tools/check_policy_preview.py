@@ -72,6 +72,10 @@ def _set_default_preview_fields(armature) -> None:
     armature.duck_policy_seed = 0
 
 
+def _execution_source(session) -> str:
+    return "exporter_child" if session is not None else "validated_cache"
+
+
 def check_policy_preview(args: argparse.Namespace) -> dict[str, object]:
     blend_path = args.blend.expanduser().resolve()
     roundtrip_output = args.roundtrip_output.expanduser().resolve()
@@ -87,6 +91,13 @@ def check_policy_preview(args: argparse.Namespace) -> dict[str, object]:
             raise AssertionError(
                 "duck.generate_policy_preview returned "
                 f"{result!r}, expected {{'FINISHED'}}"
+            )
+        execution_source = _execution_source(addon._POLICY_PREVIEW_SESSION)
+        launch_status = armature.duck_policy_status
+        if execution_source == "exporter_child" and launch_status != "Exporting":
+            raise AssertionError(
+                f"exporter child started with status {launch_status!r}, "
+                "expected 'Exporting'"
             )
 
         deadline = time.monotonic() + args.timeout
@@ -142,8 +153,10 @@ def check_policy_preview(args: argparse.Namespace) -> dict[str, object]:
             "action_name": action.name,
             "frames": 200,
             "cache_key": str(action.get("duck_policy_preview_cache_key", "")),
+            "execution_source": execution_source,
             "root_travel_m": root_travel,
             "roundtrip_archive": str(destination),
+            "launch_status": launch_status,
         }
     finally:
         addon._clear_policy_preview_job(force=True)

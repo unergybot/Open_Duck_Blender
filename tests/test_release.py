@@ -11,6 +11,34 @@ POLICY_PREVIEW_CHECKER = Path(__file__).parents[1] / "tools/check_policy_preview
 
 
 class ReleaseArtifactTests(unittest.TestCase):
+    def test_policy_preview_checker_reports_execution_source(self):
+        expression = (
+            "import json,sys;"
+            f"sys.path.insert(0,{str(POLICY_PREVIEW_CHECKER.parents[1])!r});"
+            "from tools.check_policy_preview import _execution_source;"
+            "print(json.dumps([_execution_source(object()),"
+            "_execution_source(None)]))"
+        )
+        result = subprocess.run(
+            (
+                bpy.app.binary_path,
+                "--background",
+                "--factory-startup",
+                "--python-exit-code",
+                "1",
+                "--python-expr",
+                expression,
+            ),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        sources = json.loads(
+            next(line for line in result.stdout.splitlines() if line.startswith("["))
+        )
+        self.assertEqual(sources, ["exporter_child", "validated_cache"])
+
     def test_policy_preview_checker_uses_stable_defaults(self):
         expression = (
             "import json,sys;"
