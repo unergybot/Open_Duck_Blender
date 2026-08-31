@@ -46,7 +46,9 @@ Work in the Blender repair worktree.
 
 - Add failing Blender tests that reproduce: zero-length matrix orientation loss,
   tail-based bone-parent offset, duplicate shared-mesh material slots, stale
-  initial Cream colors, and unvalidated geom transforms.
+  initial Cream colors, unvalidated geom transforms, and Blender 4.3's enum
+  IDProperty/string collision in the colorway callback. The suite output must
+  be exception-free in both supported versions.
 - Create body and mouth bones by setting a nonzero display length before their
   exact MJCF world-rest matrix. Canonical body bone local Z remains the joint
   axis used by actions/export.
