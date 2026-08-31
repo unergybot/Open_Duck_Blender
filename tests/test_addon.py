@@ -153,6 +153,94 @@ class PolicyPreviewOperatorTests(unittest.TestCase):
         self.assertEqual(process.closed, [False])
         self.assertIsNone(addon._POLICY_PREVIEW_SESSION)
 
+    def test_success_imports_into_launch_scene_when_ambient_scene_changed(self):
+        launch_scene = bpy.context.scene
+        launch_scene.frame_start, launch_scene.frame_end = 7, 9
+        launch_scene.frame_set(8)
+        launch_scene.render.fps = 24
+        launch_scene.render.fps_base = 1.0
+        output = self.validated.cache_path.with_name("scene-switched.npz")
+        self.write_archive(output)
+        process = FakePreviewProcess(ProcessOutcome(0, False, "Frames: 3"))
+        self.install_session(process, output)
+        bpy.ops.screen.animation_play()
+
+        ambient_scene = bpy.data.scenes.new("Ambient")
+        ambient_scene.frame_start, ambient_scene.frame_end = 30, 40
+        ambient_scene.frame_set(35)
+        ambient_scene.render.fps = 60
+        ambient_scene.render.fps_base = 1.25
+        ambient_before = (
+            ambient_scene.frame_start,
+            ambient_scene.frame_end,
+            ambient_scene.frame_current,
+            ambient_scene.render.fps,
+            ambient_scene.render.fps_base,
+        )
+        bpy.context.window.scene = ambient_scene
+
+        self.assertIsNone(addon._poll_policy_preview_job())
+
+        self.assertIs(bpy.context.scene, ambient_scene)
+        self.assertEqual(
+            (
+                ambient_scene.frame_start,
+                ambient_scene.frame_end,
+                ambient_scene.frame_current,
+                ambient_scene.render.fps,
+                ambient_scene.render.fps_base,
+            ),
+            ambient_before,
+        )
+        self.assertEqual(
+            (
+                launch_scene.frame_start,
+                launch_scene.frame_end,
+                launch_scene.frame_current,
+                launch_scene.render.fps,
+                launch_scene.render.fps_base,
+            ),
+            (1, 3, 1, 50, 1.0),
+        )
+        self.assertFalse(bpy.context.screen.is_animation_playing)
+        self.assertEqual(
+            self.armature.animation_data.action.name,
+            "PolicyWalk_x0.30_y0.00_yaw0.00",
+        )
+
+    def test_missing_launch_scene_force_cleans_without_import(self):
+        launch_scene = bpy.context.scene
+        replacement = bpy.data.scenes.new("Replacement")
+        replacement.collection.objects.link(self.armature)
+        replacement.frame_start, replacement.frame_end = 20, 30
+        replacement.frame_set(25)
+        output = self.validated.cache_path.with_name("missing-scene.npz")
+        self.write_archive(output)
+        process = FakePreviewProcess(ProcessOutcome(0, False, "Frames: 3"))
+        self.install_session(process, output)
+        original_actions = {action.name for action in bpy.data.actions}
+        bpy.context.window.scene = replacement
+        bpy.data.scenes.remove(launch_scene)
+
+        self.assertIsNone(addon._poll_policy_preview_job())
+
+        self.assertEqual({action.name for action in bpy.data.actions}, original_actions)
+        self.assertTrue(
+            self.armature.animation_data is None
+            or self.armature.animation_data.action is None
+        )
+        self.assertEqual(
+            (
+                replacement.frame_start,
+                replacement.frame_end,
+                replacement.frame_current,
+            ),
+            (20, 30, 25),
+        )
+        self.assertEqual(process.closed, [True])
+        self.assertFalse(output.exists())
+        self.assertIsNone(addon._POLICY_PREVIEW_SESSION)
+
     def test_exact_cache_hit_imports_without_starting_process(self):
         self.write_archive(self.validated.cache_path)
         with mock.patch.object(

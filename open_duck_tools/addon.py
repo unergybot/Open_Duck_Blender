@@ -665,6 +665,10 @@ def _resolve_policy_preview_armature(session: _PolicyPreviewSession):
     return armature
 
 
+def _resolve_policy_preview_scene(session: _PolicyPreviewSession):
+    return bpy.data.scenes.get(session.scene_name)
+
+
 def _validate_policy_preview_archive(path, profile, validated):
     motion = load_motion(path, profile)
     if motion.frames != validated.frames:
@@ -687,23 +691,27 @@ def _import_policy_preview(session: _PolicyPreviewSession, path):
     armature = _resolve_policy_preview_armature(session)
     if armature is None:
         raise ProfileError("the policy preview armature is no longer available")
-    profile = profile_from_armature(armature)
-    armature.duck_policy_status = "Validating"
-    source_path = Path(path)
-    motion = _validate_policy_preview_archive(
-        source_path, profile, session.validated
-    )
-    if source_path != session.validated.cache_path:
-        os.replace(source_path, session.validated.cache_path)
-    armature.duck_policy_status = "Importing"
-    action = import_motion_action(
-        armature,
-        profile,
-        session.validated.cache_path,
-        action_name=session.validated.action_name,
-        motion_kind="policy_preview",
-        before_mutation=lambda: _stop_playback(bpy.context),
-    )
+    scene = _resolve_policy_preview_scene(session)
+    if scene is None:
+        raise ProfileError("the policy preview launch scene is no longer available")
+    with bpy.context.temp_override(scene=scene, view_layer=scene.view_layers[0]):
+        profile = profile_from_armature(armature)
+        armature.duck_policy_status = "Validating"
+        source_path = Path(path)
+        motion = _validate_policy_preview_archive(
+            source_path, profile, session.validated
+        )
+        if source_path != session.validated.cache_path:
+            os.replace(source_path, session.validated.cache_path)
+        armature.duck_policy_status = "Importing"
+        action = import_motion_action(
+            armature,
+            profile,
+            session.validated.cache_path,
+            action_name=session.validated.action_name,
+            motion_kind="policy_preview",
+            before_mutation=lambda: _stop_playback(bpy.context),
+        )
     action["duck_policy_preview_cache_key"] = session.validated.cache_key
     armature.duck_policy_status = f"Imported {action.name} ({motion.frames} frames)"
     armature.duck_policy_details = ""
@@ -742,6 +750,13 @@ def _poll_policy_preview_job():
         return None
     armature = _resolve_policy_preview_armature(session)
     if armature is None:
+        _clear_policy_preview_job(force=True)
+        return None
+    if _resolve_policy_preview_scene(session) is None:
+        armature.duck_policy_status = "Policy preview failed"
+        armature.duck_policy_details = (
+            "The policy preview launch scene is no longer available"
+        )
         _clear_policy_preview_job(force=True)
         return None
     outcome = session.process.poll()
