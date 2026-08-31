@@ -20,6 +20,7 @@ from .blender_bridge import (
     matrix_residual,
     reset_canonical_pose,
 )
+from .ik import leg_kinematics, solve_leg_ik
 from .motion import MotionError, build_motion_archive, save_motion_npz
 from .motion_import import import_motion_action
 from .profile import ProfileError, profile_from_json
@@ -32,6 +33,7 @@ COLORWAYS = {
     "SKY": ("Sky", "#a9dbe8", "#f59e0b"),
 }
 BEGINNER_ACTION_PRESETS = (("Policy_alpha_walking_forward", "Walk"),)
+_IK_UPDATE_GUARD: set[int] = set()
 
 
 def _srgb_channel(value: int) -> float:
@@ -211,21 +213,111 @@ def _mouth_updated(self, _context):
         _apply_mouth_pose(self, self.duck_mouth_open)
 
 
-def _leg_body_chain(profile, side: str) -> list[str]:
-    by_joint = {joint.name: joint.child_body for joint in profile.joints}
-    names = [
-        f"{side}_hip_roll",
-        f"{side}_hip_pitch",
-        f"{side}_knee",
-        f"{side}_ankle",
-    ]
-    return [by_joint[name] for name in names if name in by_joint]
+def _leg_joint_specs(profile, side: str):
+    by_name = {joint.name: joint for joint in profile.joints}
+    names = tuple(
+        f"{side}_{suffix}"
+        for suffix in ("hip_roll", "hip_pitch", "knee", "ankle")
+    )
+    try:
+        return tuple(by_name[name] for name in names)
+    except KeyError as exc:
+        raise MotionError(f"profile is missing complete {side} leg chain") from exc
 
 
-def _ankle_target_matrix(armature_world: Matrix, ankle_matrix: Matrix, ankle_tail):
-    target = armature_world @ ankle_matrix
-    target.translation = armature_world @ ankle_tail
-    return target
+def _physical_site_matrix(armature, profile, side: str) -> Matrix:
+    site = next(
+        (site for site in profile.sites if site.name == f"{side}_foot"),
+        None,
+    )
+    if site is None:
+        raise MotionError(f"profile is missing physical site {side}_foot")
+    ankle = armature.pose.bones.get(site.parent_body)
+    if ankle is None:
+        raise MotionError(f"armature is missing ankle body {site.parent_body}")
+    return ankle.matrix @ Matrix.Translation(site.position) @ Quaternion(
+        site.quaternion_wxyz
+    ).to_matrix().to_4x4()
+
+
+def update_physical_ik(armature) -> None:
+    """Solve both physical foot controls onto canonical local-Z hinges."""
+    if float(armature.get("fk_ik", 0.0)) < 0.5:
+        return
+    bpy.context.view_layer.update()
+    profile = profile_from_armature(armature)
+    solutions = []
+    for side in ("left", "right"):
+        joints = _leg_joint_specs(profile, side)
+        foot = armature.pose.bones.get(f"IK_FOOT_{side}")
+        pole = armature.pose.bones.get(f"IK_POLE_{side}")
+        hip_yaw = armature.pose.bones.get(joints[0].parent_body)
+        if foot is None or pole is None or hip_yaw is None:
+            raise MotionError(f"armature is missing {side} physical IK controls")
+        model = leg_kinematics(profile, side)
+        hip_inverse = hip_yaw.matrix.inverted_safe()
+        target = hip_inverse @ foot.matrix.translation
+        pole_local = hip_inverse @ pole.matrix.translation
+        initial = np.asarray(
+            [armature.pose.bones[joint.child_body].rotation_euler.z for joint in joints],
+            dtype=np.float64,
+        )
+        result = solve_leg_ik(
+            model,
+            tuple(target),
+            float(foot.get("duck_sagittal_pitch", 0.0)),
+            initial_angles=initial,
+            pole_sign=float(pole_local.y),
+        )
+        solutions.append((joints, foot, result))
+    for joints, foot, result in solutions:
+        for joint, angle in zip(joints, result.angles, strict=True):
+            pose_bone = armature.pose.bones[joint.child_body]
+            pose_bone.rotation_mode = "XYZ"
+            pose_bone.location = (0.0, 0.0, 0.0)
+            pose_bone.scale = (1.0, 1.0, 1.0)
+            pose_bone.rotation_euler = (0.0, 0.0, float(angle))
+        foot["duck_ik_clamped"] = bool(result.clamped)
+
+
+def _clear_physical_ik_handlers() -> None:
+    for handlers in (
+        bpy.app.handlers.frame_change_post,
+        bpy.app.handlers.depsgraph_update_post,
+    ):
+        for handler in tuple(handlers):
+            if getattr(handler, "_duck_physical_ik_handler", False):
+                handlers.remove(handler)
+
+
+@bpy.app.handlers.persistent
+def _physical_ik_update_handler(_scene, *_args) -> None:
+    for armature in tuple(bpy.data.objects):
+        if (
+            armature.type != "ARMATURE"
+            or armature.get("duck_robot_id") != "microduck-alpha"
+            or float(armature.get("fk_ik", 0.0)) < 0.5
+        ):
+            continue
+        pointer = armature.as_pointer()
+        if pointer in _IK_UPDATE_GUARD:
+            continue
+        _IK_UPDATE_GUARD.add(pointer)
+        try:
+            update_physical_ik(armature)
+        except (MotionError, ProfileError, ValueError):
+            armature["duck_ik_update_error"] = True
+        finally:
+            _IK_UPDATE_GUARD.discard(pointer)
+
+
+_physical_ik_update_handler._duck_physical_ik_handler = True
+
+
+def _install_physical_ik_handlers() -> None:
+    _clear_physical_ik_handlers()
+    bpy.app.handlers.frame_change_post.append(_physical_ik_update_handler)
+    bpy.app.handlers.depsgraph_update_post.append(_physical_ik_update_handler)
 
 
 class DUCK_OT_switch_ik(bpy.types.Operator):
@@ -236,22 +328,37 @@ class DUCK_OT_switch_ik(bpy.types.Operator):
     def execute(self, context):
         armature = context.object
         profile = profile_from_armature(armature)
-        for side in ("left", "right"):
-            chain = _leg_body_chain(profile, side)
-            ankle = armature.pose.bones.get(chain[-1]) if len(chain) == 4 else None
-            target = bpy.data.objects.get(f"IK_FOOT_{side}")
-            if ankle is None or target is None:
-                self.report({"ERROR"}, f"Missing {side} IK controls")
-                return {"CANCELLED"}
-            target.matrix_world = _ankle_target_matrix(
-                armature.matrix_world, ankle.matrix, ankle.tail
-            )
-            for constraint in ankle.constraints:
-                if constraint.name.startswith("DUCK_IK"):
-                    constraint.influence = 1.0
-        armature["fk_ik"] = 1.0
-        context.view_layer.update()
-        return {"FINISHED"}
+        original_flag = float(armature.get("fk_ik", 0.0))
+        targets = {}
+        try:
+            for side in ("left", "right"):
+                joints = _leg_joint_specs(profile, side)
+                target = armature.pose.bones.get(f"IK_FOOT_{side}")
+                if target is None:
+                    raise MotionError(f"armature is missing {side} foot control")
+                targets[side] = target.matrix.copy()
+                angles = np.asarray(
+                    [
+                        armature.pose.bones[joint.child_body].rotation_euler.z
+                        for joint in joints
+                    ],
+                    dtype=np.float64,
+                )
+                target.matrix = _physical_site_matrix(armature, profile, side)
+                target["duck_sagittal_pitch"] = leg_kinematics(
+                    profile, side
+                ).forward(angles).pitch
+            armature["fk_ik"] = 1.0
+            context.view_layer.update()
+            update_physical_ik(armature)
+            context.view_layer.update()
+            return {"FINISHED"}
+        except (MotionError, ValueError) as exc:
+            armature["fk_ik"] = original_flag
+            for side, matrix in targets.items():
+                armature.pose.bones[f"IK_FOOT_{side}"].matrix = matrix
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
 
 
 class DUCK_OT_switch_fk(bpy.types.Operator):
@@ -261,30 +368,8 @@ class DUCK_OT_switch_fk(bpy.types.Operator):
 
     def execute(self, context):
         armature = context.object
-        profile = profile_from_armature(armature)
-        chains = {side: _leg_body_chain(profile, side) for side in ("left", "right")}
-        if any(len(chain) != 4 for chain in chains.values()):
-            self.report({"ERROR"}, "Profile is missing a complete leg chain")
-            return {"CANCELLED"}
-        evaluated = armature.evaluated_get(context.evaluated_depsgraph_get())
-        solved = {
-            name: evaluated.pose.bones[name].matrix.copy()
-            for chain in chains.values()
-            for name in chain
-        }
-        for side, chain in chains.items():
-            ankle = armature.pose.bones.get(chain[-1])
-            if ankle is None:
-                self.report({"ERROR"}, f"Missing {side} FK controls")
-                return {"CANCELLED"}
-            for constraint in ankle.constraints:
-                if constraint.name.startswith("DUCK_IK"):
-                    constraint.influence = 0.0
-            context.view_layer.update()
-            for name in chain:
-                armature.pose.bones[name].matrix = solved[name]
-                context.view_layer.update()
         armature["fk_ik"] = 0.0
+        context.view_layer.update()
         return {"FINISHED"}
 
 
@@ -637,6 +722,7 @@ CLASSES = (
 def register():
     _clear_play_once_handlers()
     _clear_native_playback_handlers()
+    _install_physical_ik_handlers()
     for cls in CLASSES:
         if not hasattr(bpy.types, cls.__name__):
             bpy.utils.register_class(cls)
@@ -667,6 +753,8 @@ def unregister():
     _stop_playback(bpy.context)
     _clear_play_once_handlers()
     _clear_native_playback_handlers()
+    _clear_physical_ik_handlers()
+    _IK_UPDATE_GUARD.clear()
     if hasattr(bpy.types.Object, "duck_action_name"):
         del bpy.types.Object.duck_action_name
     if hasattr(bpy.types.Object, "duck_mouth_open"):

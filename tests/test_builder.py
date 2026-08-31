@@ -10,7 +10,7 @@ import xml.etree.ElementTree as ET
 
 import bpy
 import numpy as np
-from mathutils import Matrix, Quaternion
+from mathutils import Matrix, Quaternion, Vector
 
 from open_duck_tools.builder import _transform, generate_microduck_scene
 from open_duck_tools.motion import MotionError, build_motion_archive
@@ -391,6 +391,222 @@ class SceneBuilderTests(unittest.TestCase):
             (0.7071067811865476, 0.7071067811865476, 0.0, 0.0)
         ).to_matrix().to_4x4()
         assert_matrix_almost_equal(self, actual, expected)
+
+    @unittest.skipUnless(
+        all(
+            path.is_file()
+            for path in (CANONICAL_MJCF, CANONICAL_RUNTIME, CANONICAL_CONTRACT)
+        ),
+        "canonical Microduck source checkouts are unavailable",
+    )
+    def test_physical_ik_controls_use_sites_without_native_constraints(self):
+        profile = build_microduck_profile(
+            CANONICAL_MJCF,
+            CANONICAL_RUNTIME,
+            None,
+            joint_contract_path=CANONICAL_CONTRACT,
+        )
+        armature = generate_microduck_scene(
+            profile, CANONICAL_MJCF, Path("open_duck_tools")
+        )
+        joints = {joint.name: joint for joint in profile.joints}
+        sites = {site.name: site for site in profile.sites}
+
+        for side in ("left", "right"):
+            names = tuple(
+                f"{side}_{suffix}"
+                for suffix in ("hip_roll", "hip_pitch", "knee", "ankle")
+            )
+            for name in names:
+                helper = armature.data.bones.get(f"ik::{name}")
+                self.assertIsNotNone(helper, name)
+                self.assertFalse(helper.use_deform)
+            foot = armature.pose.bones.get(f"IK_FOOT_{side}")
+            pole = armature.pose.bones.get(f"IK_POLE_{side}")
+            self.assertIsNotNone(foot)
+            self.assertIsNotNone(pole)
+            ankle_body = joints[f"{side}_ankle"].child_body
+            site = sites[f"{side}_foot"]
+            expected = (
+                armature.data.bones[ankle_body].matrix_local
+                @ Matrix.Translation(site.position)
+                @ Quaternion(site.quaternion_wxyz).to_matrix().to_4x4()
+            )
+            assert_matrix_almost_equal(
+                self, armature.data.bones[foot.name].matrix_local, expected
+            )
+            self.assertIn("duck_sagittal_pitch", foot)
+
+        duck_constraints = [
+            constraint
+            for bone in armature.pose.bones
+            for constraint in bone.constraints
+            if constraint.name.startswith("DUCK_IK")
+        ]
+        self.assertEqual(duck_constraints, [])
+
+        joint_children = {joint.child_body for joint in profile.joints}
+        for body_name in profile.body_names:
+            pose_bone = armature.pose.bones[body_name]
+            self.assertEqual(tuple(pose_bone.lock_location), (True, True, True))
+            self.assertEqual(tuple(pose_bone.lock_scale), (True, True, True))
+            self.assertEqual(
+                tuple(pose_bone.lock_rotation),
+                (True, True, False)
+                if body_name in joint_children
+                else (True, True, True),
+            )
+
+    @unittest.skipUnless(
+        all(
+            path.is_file()
+            for path in (CANONICAL_MJCF, CANONICAL_RUNTIME, CANONICAL_CONTRACT)
+        ),
+        "canonical Microduck source checkouts are unavailable",
+    )
+    def test_fk_ik_switch_preserves_pose_and_solves_moved_physical_site(self):
+        profile = build_microduck_profile(
+            CANONICAL_MJCF,
+            CANONICAL_RUNTIME,
+            None,
+            joint_contract_path=CANONICAL_CONTRACT,
+        )
+        armature = generate_microduck_scene(
+            profile, CANONICAL_MJCF, Path("open_duck_tools")
+        )
+        bpy.context.view_layer.objects.active = armature
+        armature.select_set(True)
+        bpy.context.view_layer.update()
+        before = {
+            name: armature.pose.bones[name].matrix.copy()
+            for name in profile.body_names
+        }
+
+        self.assertEqual(bpy.ops.duck.switch_ik(), {"FINISHED"})
+        self.assertEqual(armature["fk_ik"], 1.0)
+        for name, expected in before.items():
+            assert_matrix_almost_equal(
+                self, armature.pose.bones[name].matrix, expected, places=5
+            )
+
+        target = armature.pose.bones["IK_FOOT_left"]
+        desired = target.matrix.translation.copy() + Vector((0.004, 0.0, 0.003))
+        target.matrix.translation = desired
+        addon.update_physical_ik(armature)
+        bpy.context.view_layer.update()
+        site = next(site for site in profile.sites if site.name == "left_foot")
+        ankle = armature.pose.bones[site.parent_body]
+        actual = (
+            ankle.matrix
+            @ Matrix.Translation(site.position)
+            @ Quaternion(site.quaternion_wxyz).to_matrix().to_4x4()
+        ).translation
+        self.assertLess((actual - desired).length, 1e-5)
+        for suffix in ("hip_roll", "hip_pitch", "knee", "ankle"):
+            joint = next(
+                joint
+                for joint in profile.joints
+                if joint.name == f"left_{suffix}"
+            )
+            bone = armature.pose.bones[joint.child_body]
+            self.assertAlmostEqual(bone.rotation_euler.x, 0.0, places=7)
+            self.assertAlmostEqual(bone.rotation_euler.y, 0.0, places=7)
+            self.assertGreaterEqual(bone.rotation_euler.z, joint.range_rad[0])
+            self.assertLessEqual(bone.rotation_euler.z, joint.range_rad[1])
+
+        solved = {
+            name: armature.pose.bones[name].matrix.copy()
+            for name in profile.body_names
+        }
+        self.assertEqual(bpy.ops.duck.switch_fk(), {"FINISHED"})
+        self.assertEqual(armature["fk_ik"], 0.0)
+        for name, expected in solved.items():
+            assert_matrix_almost_equal(
+                self, armature.pose.bones[name].matrix, expected, places=5
+            )
+
+    @unittest.skipUnless(
+        all(
+            path.is_file()
+            for path in (CANONICAL_MJCF, CANONICAL_RUNTIME, CANONICAL_CONTRACT)
+        ),
+        "canonical Microduck source checkouts are unavailable",
+    )
+    def test_keyed_foot_control_is_solved_by_guarded_frame_handler(self):
+        profile = build_microduck_profile(
+            CANONICAL_MJCF,
+            CANONICAL_RUNTIME,
+            None,
+            joint_contract_path=CANONICAL_CONTRACT,
+        )
+        armature = generate_microduck_scene(
+            profile, CANONICAL_MJCF, Path("open_duck_tools")
+        )
+        bpy.context.view_layer.objects.active = armature
+        armature.select_set(True)
+        self.assertEqual(bpy.ops.duck.switch_ik(), {"FINISHED"})
+        target = armature.pose.bones["IK_FOOT_left"]
+        scene = bpy.context.scene
+        scene.frame_set(1)
+        target.keyframe_insert("location", frame=1)
+        target.location.x += 0.004
+        target.location.z += 0.003
+        target.keyframe_insert("location", frame=2)
+        bpy.context.view_layer.update()
+        desired = target.matrix.translation.copy()
+
+        scene.frame_set(1)
+        scene.frame_set(2)
+        site = next(site for site in profile.sites if site.name == "left_foot")
+        actual = (
+            armature.pose.bones[site.parent_body].matrix
+            @ Matrix.Translation(site.position)
+            @ Quaternion(site.quaternion_wxyz).to_matrix().to_4x4()
+        ).translation
+        self.assertLess((actual - desired).length, 1e-5)
+        self.assertTrue(
+            any(
+                getattr(handler, "_duck_physical_ik_handler", False)
+                for handler in bpy.app.handlers.frame_change_post
+            )
+        )
+
+    @unittest.skipUnless(
+        all(
+            path.is_file()
+            for path in (CANONICAL_MJCF, CANONICAL_RUNTIME, CANONICAL_CONTRACT)
+        ),
+        "canonical Microduck source checkouts are unavailable",
+    )
+    def test_two_leg_live_update_rolls_back_when_either_target_is_invalid(self):
+        profile = build_microduck_profile(
+            CANONICAL_MJCF,
+            CANONICAL_RUNTIME,
+            None,
+            joint_contract_path=CANONICAL_CONTRACT,
+        )
+        armature = generate_microduck_scene(
+            profile, CANONICAL_MJCF, Path("open_duck_tools")
+        )
+        bpy.context.view_layer.objects.active = armature
+        armature.select_set(True)
+        self.assertEqual(bpy.ops.duck.switch_ik(), {"FINISHED"})
+        addon._clear_physical_ik_handlers()
+        armature.pose.bones["IK_FOOT_left"].location.x += 0.004
+        armature.pose.bones["IK_FOOT_right"]["duck_sagittal_pitch"] = math.nan
+        bpy.context.view_layer.update()
+        before = {
+            name: armature.pose.bones[name].matrix_basis.copy()
+            for name in profile.body_names
+        }
+
+        with self.assertRaisesRegex(ValueError, "finite"):
+            addon.update_physical_ik(armature)
+
+        for name, expected in before.items():
+            assert_matrix_almost_equal(
+                self, armature.pose.bones[name].matrix_basis, expected
+            )
 
     @unittest.skipUnless(
         all(

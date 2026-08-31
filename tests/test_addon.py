@@ -6,7 +6,7 @@ from unittest import mock
 
 import bpy
 import numpy as np
-from mathutils import Matrix, Vector
+from mathutils import Matrix
 
 from open_duck_tools import addon
 from open_duck_tools.motion import MotionError
@@ -46,22 +46,6 @@ class AddonRegistrationTests(unittest.TestCase):
         self.assertTrue(hasattr(bpy.types, "DUCK_OT_import_motion"))
         self.assertIn(addon.DUCK_OT_import_motion, addon.CLASSES)
         self.assertTrue(hasattr(bpy.types.Object, "duck_colorway"))
-
-    def test_ik_target_uses_ankle_tail_without_changing_orientation(self):
-        armature_world = Matrix.Translation((1.0, 2.0, 3.0))
-        ankle_matrix = Matrix.Rotation(0.3, 4, "Z")
-        ankle_matrix.translation = (0.1, 0.2, 0.3)
-        ankle_tail = Vector((0.1, 0.215, 0.3))
-        target = addon._ankle_target_matrix(armature_world, ankle_matrix, ankle_tail)
-        for actual, expected in zip(target.translation, (1.1, 2.215, 3.3)):
-            self.assertAlmostEqual(actual, expected, places=6)
-        self.assertLess(
-            target.to_quaternion().rotation_difference(
-                (armature_world @ ankle_matrix).to_quaternion()
-            ).angle,
-            1e-7,
-        )
-
 
 class MotionImportOperatorTests(unittest.TestCase):
     def setUp(self):

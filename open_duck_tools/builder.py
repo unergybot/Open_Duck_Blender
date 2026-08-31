@@ -87,7 +87,14 @@ def _material(name: str, rgba: tuple[float, float, float, float]):
 
 
 def _embed_addon(addon_source_root: Path) -> None:
-    module_names = ("profile", "motion", "blender_bridge", "motion_import", "addon")
+    module_names = (
+        "profile",
+        "motion",
+        "blender_bridge",
+        "motion_import",
+        "ik",
+        "addon",
+    )
     for name in module_names:
         path = addon_source_root / f"{name}.py"
         if not path.exists():
@@ -99,7 +106,7 @@ def _embed_addon(addon_source_root: Path) -> None:
         text.write(path.read_text())
     bootstrap_source = '''import bpy, sys, types
 
-MODULES = ("profile", "motion", "blender_bridge", "motion_import", "addon")
+MODULES = ("profile", "motion", "blender_bridge", "motion_import", "ik", "addon")
 PACKAGE = "open_duck_tools_embedded"
 
 def register():
@@ -170,6 +177,44 @@ def _create_armature(profile, world_rest: dict[str, Matrix]):
         )
         bone.parent = parent
         bone.use_connect = False
+    joints_by_name = {joint.name: joint for joint in profile.joints}
+    sites_by_name = {site.name: site for site in profile.sites}
+    for side in ("left", "right"):
+        names = tuple(
+            f"{side}_{suffix}"
+            for suffix in ("hip_roll", "hip_pitch", "knee", "ankle")
+        )
+        if any(name not in joints_by_name for name in names):
+            continue
+        helpers = []
+        for name in names:
+            joint = joints_by_name[name]
+            bone = data.edit_bones.new(f"ik::{name}")
+            bone.length = 0.015
+            bone.matrix = world_rest[joint.child_body]
+            bone.parent = helpers[-1] if helpers else body_bones[joint.parent_body]
+            bone.use_connect = False
+            bone.use_deform = False
+            helpers.append(bone)
+        site = sites_by_name.get(f"{side}_foot")
+        if site is None:
+            raise ProfileError(f"profile is missing physical site {side}_foot")
+        site_matrix = world_rest[site.parent_body] @ _transform(
+            site.position,
+            site.quaternion_wxyz,
+            field=f"site {site.name}",
+        )
+        foot = data.edit_bones.new(f"IK_FOOT_{side}")
+        foot.length = 0.03
+        foot.matrix = site_matrix
+        foot.use_deform = False
+        knee_matrix = world_rest[joints_by_name[f"{side}_knee"].child_body].copy()
+        pole = data.edit_bones.new(f"IK_POLE_{side}")
+        pole.length = 0.025
+        pole.matrix = Matrix.Translation(
+            knee_matrix.translation + Vector((0.0, 0.08 if side == "left" else -0.08, 0.0))
+        )
+        pole.use_deform = False
     bpy.ops.object.mode_set(mode="POSE")
     home = dict(zip(profile.joint_names, profile.home_positions))
     joint_by_name = {joint.name: joint for joint in profile.joints}
@@ -178,41 +223,41 @@ def _create_armature(profile, world_rest: dict[str, Matrix]):
         pose_bone = armature.pose.bones[joint.child_body]
         pose_bone.rotation_mode = "XYZ"
         pose_bone.rotation_euler = (0.0, 0.0, angle)
+        pose_bone.lock_location = (True, True, True)
+        pose_bone.lock_scale = (True, True, True)
         pose_bone.lock_rotation = (True, True, False)
         pose_bone["duck_joint_name"] = name
+    joint_children = {joint.child_body for joint in profile.joints}
+    for body in profile.bodies:
+        pose_bone = armature.pose.bones[body.name]
+        pose_bone.lock_location = (True, True, True)
+        pose_bone.lock_scale = (True, True, True)
+        if body.name not in joint_children:
+            pose_bone.lock_rotation = (True, True, True)
+    for link in profile.mouth.links:
+        pose_bone = armature.pose.bones[f"mouth::{link.name}"]
+        pose_bone.lock_location = (True, True, True)
+        pose_bone.lock_rotation = (True, True, True)
+        pose_bone.lock_scale = (True, True, True)
+    for side in ("left", "right"):
+        for suffix in ("hip_roll", "hip_pitch", "knee", "ankle"):
+            helper = armature.pose.bones.get(f"ik::{side}_{suffix}")
+            if helper is not None:
+                helper.lock_location = (True, True, True)
+                helper.lock_rotation = (True, True, True)
+                helper.lock_scale = (True, True, True)
+        foot = armature.pose.bones.get(f"IK_FOOT_{side}")
+        pole = armature.pose.bones.get(f"IK_POLE_{side}")
+        if foot is not None:
+            foot.rotation_mode = "XYZ"
+            foot.lock_rotation = (True, True, True)
+            foot.lock_scale = (True, True, True)
+            foot["duck_sagittal_pitch"] = 0.0
+        if pole is not None:
+            pole.lock_rotation = (True, True, True)
+            pole.lock_scale = (True, True, True)
     bpy.ops.object.mode_set(mode="OBJECT")
     return armature
-
-
-def _create_ik(profile, armature, world_rest):
-    by_joint = {joint.name: joint.child_body for joint in profile.joints}
-    for side in ("left", "right"):
-        names = [
-            f"{side}_hip_roll",
-            f"{side}_hip_pitch",
-            f"{side}_knee",
-            f"{side}_ankle",
-        ]
-        if any(name not in by_joint for name in names):
-            continue
-        ankle_body = by_joint[names[-1]]
-        target = bpy.data.objects.new(f"IK_FOOT_{side}", None)
-        target.empty_display_type = "CUBE"
-        target.empty_display_size = 0.025
-        target.matrix_world = world_rest[ankle_body]
-        bpy.context.scene.collection.objects.link(target)
-        ankle = armature.pose.bones[ankle_body]
-        ik = ankle.constraints.new("IK")
-        ik.name = "DUCK_IK"
-        ik.target = target
-        ik.chain_count = 4
-        ik.influence = 0.0
-        rotation = ankle.constraints.new("COPY_ROTATION")
-        rotation.name = "DUCK_IK_ROTATION"
-        rotation.target = target
-        rotation.target_space = "WORLD"
-        rotation.owner_space = "WORLD"
-        rotation.influence = 0.0
 
 
 def _create_visuals(profile, mjcf_path: Path, armature, world_rest):
@@ -323,7 +368,6 @@ def generate_microduck_scene(
 
     addon.register()
     armature.duck_mouth_open = 0.0
-    _create_ik(profile, armature, world_rest)
     _create_visuals(profile, mjcf_path, armature, world_rest)
     addon._apply_colorway(armature, "CREAM")
     _embed_addon(addon_source_root)
