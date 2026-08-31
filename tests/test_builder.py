@@ -1,6 +1,7 @@
 import json
 import math
 import struct
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -138,6 +139,30 @@ class SceneBuilderTests(unittest.TestCase):
         self.assertIsNotNone(bootstrap)
         self.assertTrue(bootstrap.use_module)
         self.assertEqual(bootstrap.as_string().rstrip().splitlines()[-1], "register()")
+        addon.unregister()
+        first_bootstrap = {}
+        exec(
+            compile(bootstrap.as_string(), "<test-open-duck-bootstrap>", "exec"),
+            first_bootstrap,
+        )
+        first_addon = sys.modules["open_duck_tools_embedded.addon"]
+        second_bootstrap = {}
+        try:
+            exec(
+                compile(bootstrap.as_string(), "<test-open-duck-bootstrap>", "exec"),
+                second_bootstrap,
+            )
+            second_addon = sys.modules["open_duck_tools_embedded.addon"]
+            self.assertIs(bpy.types.DUCK_PT_tools, second_addon.DUCK_PT_tools)
+            self.assertTrue(hasattr(bpy.types.Object, "duck_action_name"))
+            self.assertTrue(hasattr(bpy.types, "DUCK_OT_toggle_animation"))
+        finally:
+            registered = getattr(bpy.types, "DUCK_PT_tools", None)
+            current_addon = sys.modules.get("open_duck_tools_embedded.addon")
+            if current_addon and registered is current_addon.DUCK_PT_tools:
+                current_addon.unregister()
+            elif registered is first_addon.DUCK_PT_tools:
+                first_addon.unregister()
         addon.register()
         armature.duck_mouth_open = 1.0
         bpy.context.view_layer.update()

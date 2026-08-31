@@ -82,6 +82,13 @@ MODULES = ("profile", "motion", "blender_bridge", "motion_import", "addon")
 PACKAGE = "open_duck_tools_embedded"
 
 def register():
+    previous_addon = sys.modules.get(f"{PACKAGE}.addon")
+    if (
+        previous_addon is not None
+        and getattr(bpy.types, "DUCK_PT_tools", None)
+        is getattr(previous_addon, "DUCK_PT_tools", None)
+    ):
+        previous_addon.unregister()
     package = sys.modules.get(PACKAGE)
     if package is None:
         package = types.ModuleType(PACKAGE)

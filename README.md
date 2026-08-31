@@ -207,6 +207,15 @@ and sets the scene to the archive frame range at 50 Hz. Importing never changes
 14-joint policy archive. Use **Open Duck → Export mjlab Motion** to export the
 active imported action again.
 
+### Play an animation without the Action Editor
+
+Select the Microduck armature, press `N` while the mouse is over the 3D View,
+then open **Open Duck → Animation**. Choose any embedded action from the
+searchable **Action** field, or use **Walk** and **Crouch** for the included
+milestones. **Play/Pause** loops over that action's complete frame range, and
+**Reset** returns to its first frame. This is the simplest way to preview the
+robot; opening the Dope Sheet or Action Editor is optional.
+
 ### Policy walking milestone
 
 `microduck-alpha.blend` ships with `Policy_alpha_walking_forward`, a
