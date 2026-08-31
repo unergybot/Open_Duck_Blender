@@ -187,8 +187,13 @@ class PreviewProcess:
         if force:
             if self._process.poll() is None:
                 self._process.kill()
-            self._close_stdout()
+                try:
+                    self._process.wait(timeout=0.25)
+                except subprocess.TimeoutExpired:
+                    pass
             self._reader.join(0.25)
+            if self._reader_done.is_set():
+                self._close_stdout()
             self._output_path.unlink(missing_ok=True)
             return
 

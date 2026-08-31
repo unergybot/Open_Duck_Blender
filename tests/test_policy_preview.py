@@ -3,6 +3,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import time
@@ -141,6 +142,11 @@ class FakeProcess:
         self.killed += 1
         self.returncode = -9
 
+    def wait(self, timeout=None):
+        if self.returncode is None:
+            raise subprocess.TimeoutExpired("fake", timeout)
+        return self.returncode
+
 
 class PreviewProcessTests(unittest.TestCase):
     def validated(self, root: Path):
@@ -226,3 +232,42 @@ class PreviewProcessTests(unittest.TestCase):
             job.close(force=True)
             self.assertEqual(fake.killed, 1)
             self.assertFalse(output.exists())
+
+    def test_force_close_bounds_cleanup_terminates_reader_and_reaps_live_subprocess(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            validated = self.validated(root)
+            output = temporary_output_path(validated)
+            child = None
+
+            def start_sleeping_child(*_args, **kwargs):
+                nonlocal child
+                child = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-u",
+                        "-c",
+                        "import sys,time; sys.stdout.write('started\\n'); sys.stdout.flush(); time.sleep(30)",
+                    ],
+                    stdout=kwargs["stdout"],
+                    stderr=kwargs["stderr"],
+                )
+                return child
+
+            job = PreviewProcess.start(validated, output, popen_factory=start_sleeping_child)
+            try:
+                deadline = time.monotonic() + 2.0
+                while not job._reader.is_alive() and time.monotonic() < deadline:
+                    time.sleep(0.001)
+                self.assertTrue(job._reader.is_alive())
+                started = time.monotonic()
+                job.close(force=True)
+                elapsed = time.monotonic() - started
+
+                self.assertLess(elapsed, 0.75)
+                self.assertFalse(job._reader.is_alive())
+                self.assertIsNotNone(child.returncode)
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    child.wait(timeout=1.0)
