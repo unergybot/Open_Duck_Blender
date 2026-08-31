@@ -15,7 +15,7 @@ from open_duck_tools.profile import BodySpec, JointSpec, RobotProfile
 class BlenderBridgeTests(unittest.TestCase):
     def profile(self):
         return RobotProfile(
-            schema_version=1,
+            schema_version=2,
             robot_id="fixture",
             joint_names=("hinge",),
             body_names=("root", "child"),

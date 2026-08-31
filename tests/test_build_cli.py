@@ -86,6 +86,15 @@ def write_controlled_build_sources(root: Path) -> None:
     contract.parent.mkdir(parents=True)
     bodies = []
     for joint, body in zip(JOINT_NAMES, BODY_NAMES[1:]):
+        foot_site = (
+            '<site name="left_foot" pos="0 -0.0238146 -0.0140852" '
+            'quat="0 0 0.707107 0.707107"/>'
+            if body == "ankle_left"
+            else '<site name="right_foot" pos="0 -0.0238146 -0.0140852" '
+            'quat="0.707107 -0.707107 0 0"/>'
+            if body == "ankle_right"
+            else ""
+        )
         visuals = (
             '<geom type="mesh" class="visual" mesh="jaw"/>'
             '<geom type="mesh" class="visual" mesh="jaw_soft"/>'
@@ -94,7 +103,7 @@ def write_controlled_build_sources(root: Path) -> None:
         )
         bodies.append(
             f'<body name="{body}"><joint name="{joint}" axis="0 0 1" '
-            f'range="-10 10"/>{visuals}</body>'
+            f'range="-10 10"/>{foot_site}{visuals}</body>'
         )
     (robot / "robot_walk.xml").write_text(
         '<mujoco model="microduck"><compiler meshdir="assets"/>'

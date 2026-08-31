@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
 import math
@@ -69,6 +69,14 @@ class BodySpec:
 
 
 @dataclass(frozen=True)
+class SiteSpec:
+    name: str
+    parent_body: str
+    position: tuple[float, float, float]
+    quaternion_wxyz: tuple[float, float, float, float]
+
+
+@dataclass(frozen=True)
 class RobotProfile:
     schema_version: int
     robot_id: str
@@ -79,6 +87,7 @@ class RobotProfile:
     bodies: tuple[BodySpec, ...]
     mouth: MouthLinkage
     source_sha256: dict[str, str]
+    sites: tuple[SiteSpec, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -91,6 +100,19 @@ def profile_to_json(profile: RobotProfile) -> str:
 def profile_from_json(value: str) -> RobotProfile:
     try:
         payload = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ProfileError(f"embedded robot profile is malformed: {exc}") from exc
+    schema_version = payload.get("schema_version") if isinstance(payload, dict) else None
+    if schema_version == 1:
+        raise ProfileError(
+            "embedded robot profile schema_version 1 lacks the physical IK "
+            "foot-site contract; rebuild with schema_version 2"
+        )
+    if schema_version != 2:
+        raise ProfileError(
+            f"embedded robot profile requires schema_version 2, got {schema_version!r}"
+        )
+    try:
         mouth_payload = payload["mouth"]
 
         def make_sample(sample):
@@ -117,7 +139,7 @@ def profile_from_json(value: str) -> RobotProfile:
             tuple(make_sample(sample) for sample in mouth_payload["validation_poses"]),
             mouth_payload["source_sha256"],
         )
-        return RobotProfile(
+        profile = RobotProfile(
             int(payload["schema_version"]),
             payload["robot_id"],
             tuple(payload["joint_names"]),
@@ -144,8 +166,28 @@ def profile_from_json(value: str) -> RobotProfile:
             ),
             mouth,
             dict(payload["source_sha256"]),
+            tuple(
+                SiteSpec(
+                    site["name"],
+                    site["parent_body"],
+                    _vector_from_json(site["position"], 3, f"site {site['name']} position"),
+                    _unit_quaternion(
+                        site["quaternion_wxyz"],
+                        f"site {site['name']} quaternion",
+                    ),
+                )
+                for site in payload["sites"]
+            ),
         )
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        sites = _validate_foot_sites(
+            profile.sites,
+            profile.joints,
+            required=len(profile.joints) == 14 and len(profile.bodies) == 15,
+        )
+        return replace(profile, sites=sites)
+    except ProfileError:
+        raise
+    except (KeyError, TypeError, ValueError) as exc:
         raise ProfileError(f"embedded robot profile is malformed: {exc}") from exc
 
 
@@ -165,10 +207,12 @@ def _unit_quaternion(value: Any, field: str) -> tuple[float, float, float, float
         raise ProfileError(f"{field} must be four finite numbers") from exc
     if len(quat) != 4 or not all(math.isfinite(component) for component in quat):
         raise ProfileError(f"{field} must be four finite numbers")
-    norm = math.sqrt(sum(component * component for component in quat))
-    if norm < 1e-12:
+    scale = max(abs(component) for component in quat)
+    if scale == 0.0:
         raise ProfileError(f"{field} cannot be a zero quaternion")
-    return tuple(component / norm for component in quat)
+    scaled = tuple(component / scale for component in quat)
+    norm = math.hypot(*scaled)
+    return tuple(component / norm for component in scaled)
 
 
 def _vector_from_json(value: Any, size: int, field: str) -> tuple[float, ...]:
@@ -396,16 +440,22 @@ def _runtime_contract(model_path: Path, joint_contract_path: Path | None) -> tup
     return names, positions
 
 
-def _mjcf_contract(path: Path) -> tuple[list[BodySpec], list[JointSpec]]:
+def _parse_mjcf(path: Path) -> ET.Element:
     try:
-        root = ET.parse(path).getroot()
+        return ET.parse(path).getroot()
     except (ET.ParseError, OSError) as exc:
         raise ProfileError(f"cannot parse MJCF: {exc}") from exc
+
+
+def _mjcf_contract(
+    root: ET.Element,
+) -> tuple[list[BodySpec], list[JointSpec], list[SiteSpec]]:
     worldbody = root.find("worldbody")
     if worldbody is None:
         raise ProfileError("MJCF has no worldbody")
     bodies: list[BodySpec] = []
     joints: list[JointSpec] = []
+    sites: list[SiteSpec] = []
 
     def walk(element: ET.Element, parent: str | None) -> None:
         name = element.get("name")
@@ -440,16 +490,70 @@ def _mjcf_contract(path: Path) -> tuple[list[BodySpec], list[JointSpec]]:
                     _vector(joint.get("range"), 2, (-math.inf, math.inf)),
                 )
             )
+        for site in element.findall("site"):
+            site_name = site.get("name")
+            if site_name not in {"left_foot", "right_foot"}:
+                continue
+            sites.append(
+                SiteSpec(
+                    site_name,
+                    name,
+                    _vector(site.get("pos"), 3, (0.0, 0.0, 0.0)),
+                    _unit_quaternion(
+                        _vector(site.get("quat"), 4, (1.0, 0.0, 0.0, 0.0)),
+                        f"site {site_name} quaternion",
+                    ),
+                )
+            )
         for child in element.findall("body"):
             walk(child, name)
 
     for body in worldbody.findall("body"):
         walk(body, None)
-    return bodies, joints
+    return bodies, joints, sites
 
 
-def _visual_asset_hashes(path: Path) -> dict[str, str]:
-    root = ET.parse(path).getroot()
+def _validate_foot_sites(
+    sites: tuple[SiteSpec, ...] | list[SiteSpec],
+    joints: tuple[JointSpec, ...] | list[JointSpec],
+    *,
+    required: bool,
+) -> tuple[SiteSpec, ...]:
+    selected = tuple(
+        site for site in sites if site.name in {"left_foot", "right_foot"}
+    )
+    if not required and not selected:
+        return ()
+    counts = {
+        name: sum(site.name == name for site in selected)
+        for name in ("left_foot", "right_foot")
+    }
+    if counts != {"left_foot": 1, "right_foot": 1}:
+        raise ProfileError(
+            "physical IK contract requires left_foot and right_foot exactly once"
+        )
+    by_name = {site.name: site for site in selected}
+    joint_by_name = {joint.name: joint for joint in joints}
+    for side, expected_parent in (
+        ("left", "ankle_left"),
+        ("right", "ankle_right"),
+    ):
+        site = by_name[f"{side}_foot"]
+        if site.parent_body != expected_parent:
+            raise ProfileError(
+                f"{site.name} must be a direct child of {expected_parent}, "
+                f"got {site.parent_body!r}"
+            )
+        ankle_joint = joint_by_name.get(f"{side}_ankle")
+        if ankle_joint is None or ankle_joint.child_body != expected_parent:
+            raise ProfileError(
+                f"{site.name} parent {expected_parent} must be the child body "
+                f"of joint {side}_ankle"
+            )
+    return by_name["left_foot"], by_name["right_foot"]
+
+
+def _visual_asset_hashes(path: Path, root: ET.Element) -> dict[str, str]:
     compiler = root.find("compiler")
     mesh_dir = path.parent / (
         compiler.get("meshdir", ".") if compiler is not None else "."
@@ -502,7 +606,8 @@ def build_microduck_profile(
     home_positions = [
         position for name, position in zip(runtime_names, runtime_home) if name != "mouth"
     ]
-    bodies, joints = _mjcf_contract(mjcf_path)
+    mjcf_root = _parse_mjcf(mjcf_path)
+    bodies, joints, parsed_sites = _mjcf_contract(mjcf_root)
     if len(policy_names) != expected_joint_count or len(bodies) != expected_body_count:
         raise ProfileError(
             "Microduck contract requires "
@@ -514,6 +619,11 @@ def build_microduck_profile(
         raise ProfileError(
             f"runtime/MJCF joint order differs: runtime={policy_names}, mjcf={mjcf_names}"
         )
+    sites = _validate_foot_sites(
+        parsed_sites,
+        joints,
+        required=expected_joint_count == 14 and expected_body_count == 15,
+    )
     mouth = (
         load_mouth_linkage(mouth_linkage_path)
         if mouth_linkage_path is not None
@@ -530,9 +640,9 @@ def build_microduck_profile(
     }
     if contract is not None:
         hashes["joint_contract"] = hashlib.sha256(contract.read_bytes()).hexdigest()
-    hashes.update(_visual_asset_hashes(mjcf_path))
+    hashes.update(_visual_asset_hashes(mjcf_path, mjcf_root))
     return RobotProfile(
-        1,
+        2,
         "microduck-alpha",
         tuple(policy_names),
         tuple(body.name for body in bodies),
@@ -541,4 +651,5 @@ def build_microduck_profile(
         tuple(bodies),
         mouth,
         hashes,
+        sites,
     )

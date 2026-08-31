@@ -28,7 +28,7 @@ from open_duck_tools.profile import (
 def test_profile() -> RobotProfile:
     """A compact profile whose root has a non-identity MJCF rest transform."""
     return RobotProfile(
-        schema_version=1,
+        schema_version=2,
         robot_id="test-duck",
         joint_names=("hip", "knee"),
         body_names=("root", "hip_link", "knee_link"),
