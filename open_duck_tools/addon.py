@@ -1069,6 +1069,34 @@ class DUCK_PT_tools(bpy.types.Panel):
             )
         else:
             animation.label(text="No action selected", icon="INFO")
+        if armature.get("duck_robot_id") == "microduck-alpha":
+            preview = layout.box()
+            preview.label(text="Generate Policy Preview", icon="PLAY")
+            preview.prop(armature, "duck_policy_path", text="Policy")
+            commands = preview.column(align=True)
+            commands.prop(armature, "duck_policy_forward")
+            commands.prop(armature, "duck_policy_lateral")
+            commands.prop(armature, "duck_policy_yaw")
+            row = preview.row(align=True)
+            row.prop(armature, "duck_policy_duration")
+            row.prop(armature, "duck_policy_seed")
+            preview.prop(armature, "duck_policy_setup_open", text="Setup", toggle=True)
+            if armature.duck_policy_setup_open:
+                preview.prop(armature, "duck_microduck_root")
+                preview.prop(armature, "duck_microduck_rl_root")
+            if _POLICY_PREVIEW_SESSION is None:
+                preview.operator("duck.generate_policy_preview", icon="FILE_REFRESH")
+            elif _POLICY_PREVIEW_SESSION.armature_pointer == armature.as_pointer():
+                preview.operator("duck.cancel_policy_preview", icon="CANCEL")
+            else:
+                generate = preview.row()
+                generate.enabled = False
+                generate.operator("duck.generate_policy_preview", icon="FILE_REFRESH")
+                preview.label(text="Another policy preview is running", icon="INFO")
+            preview.label(text=armature.duck_policy_status, icon="INFO")
+            if armature.duck_policy_details:
+                for line in armature.duck_policy_details.splitlines()[-4:]:
+                    preview.label(text=line[:120])
         layout.operator("duck.import_motion", icon="IMPORT")
         layout.operator("duck.export_motion", icon="EXPORT")
 

@@ -177,6 +177,7 @@ def check_release() -> dict[str, int]:
         "blender_bridge",
         "motion_import",
         "ik",
+        "policy_preview",
         "addon",
     }
     text_names = {text.name for text in bpy.data.texts}

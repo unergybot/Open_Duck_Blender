@@ -3,6 +3,7 @@ import json
 import unittest
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 from unittest import mock
 
 import bpy
@@ -58,6 +59,157 @@ class AddonRegistrationTests(unittest.TestCase):
         self.assertEqual(
             bpy.types.Object.bl_rna.properties["duck_mouth_open"].name,
             "Mouth (visual approximation)",
+        )
+
+    def test_registers_policy_preview_operators_and_defaults(self):
+        addon.register()
+        self.assertTrue(hasattr(bpy.types, "DUCK_OT_generate_policy_preview"))
+        self.assertTrue(hasattr(bpy.types, "DUCK_OT_cancel_policy_preview"))
+        self.assertAlmostEqual(
+            bpy.types.Object.bl_rna.properties["duck_policy_forward"].default, 0.30
+        )
+        self.assertEqual(
+            bpy.types.Object.bl_rna.properties["duck_policy_duration"].default, 4.0
+        )
+
+
+class RecordedLayout:
+    def __init__(self, calls, *, enabled=True):
+        self.calls = calls
+        self.enabled = enabled
+
+    def _child(self, kind, **kwargs):
+        self.calls.append((kind, kwargs, self.enabled))
+        return type(self)(self.calls, enabled=self.enabled)
+
+    def box(self):
+        return self._child("box")
+
+    def column(self, **kwargs):
+        return self._child("column", **kwargs)
+
+    def row(self, **kwargs):
+        return self._child("row", **kwargs)
+
+    def label(self, **kwargs):
+        self.calls.append(("label", kwargs, self.enabled))
+
+    def operator(self, operator_id, **kwargs):
+        self.calls.append(("operator", {"id": operator_id, **kwargs}, self.enabled))
+        return SimpleNamespace()
+
+    def prop(self, _data, property_name, **kwargs):
+        self.calls.append(("prop", {"property": property_name, **kwargs}, self.enabled))
+
+    def prop_search(
+        self, _data, property_name, _search_data, _search_property, **kwargs
+    ):
+        self.calls.append(
+            ("prop_search", {"property": property_name, **kwargs}, self.enabled)
+        )
+
+
+class PolicyPreviewPanelTests(unittest.TestCase):
+    def setUp(self):
+        bpy.ops.wm.read_factory_settings(use_empty=True)
+        addon.register()
+        self.armature = bpy.data.objects.new(
+            "MicroduckPreview", bpy.data.armatures.new("MicroduckPreview")
+        )
+        bpy.context.scene.collection.objects.link(self.armature)
+        self.armature["duck_robot_id"] = "microduck-alpha"
+        bpy.context.view_layer.objects.active = self.armature
+        self.armature.select_set(True)
+
+    def tearDown(self):
+        addon.unregister()
+
+    def draw_panel(self):
+        calls = []
+        addon.DUCK_PT_tools.draw(
+            SimpleNamespace(layout=RecordedLayout(calls)), bpy.context
+        )
+        return calls
+
+    def test_draws_policy_preview_controls_for_microduck_only(self):
+        calls = self.draw_panel()
+
+        self.assertIn(
+            ("label", {"text": "Generate Policy Preview", "icon": "PLAY"}, True),
+            calls,
+        )
+        self.assertEqual(
+            [
+                call[1]["property"]
+                for call in calls
+                if call[0] == "prop" and call[1]["property"].startswith("duck_policy_")
+            ],
+            [
+                "duck_policy_path",
+                "duck_policy_forward",
+                "duck_policy_lateral",
+                "duck_policy_yaw",
+                "duck_policy_duration",
+                "duck_policy_seed",
+                "duck_policy_setup_open",
+            ],
+        )
+        self.assertIn(("label", {"text": "Idle", "icon": "INFO"}, True), calls)
+        self.assertIn(
+            (
+                "operator",
+                {"id": "duck.generate_policy_preview", "icon": "FILE_REFRESH"},
+                True,
+            ),
+            calls,
+        )
+        self.armature["duck_robot_id"] = "other-duck"
+        calls = self.draw_panel()
+        self.assertNotIn(
+            ("label", {"text": "Generate Policy Preview", "icon": "PLAY"}, True),
+            calls,
+        )
+
+    def test_disables_generate_for_another_armatures_running_preview(self):
+        owner = bpy.data.objects.new(
+            "OtherMicroduck", bpy.data.armatures.new("OtherMicroduck")
+        )
+        bpy.context.scene.collection.objects.link(owner)
+        owner["duck_robot_id"] = "microduck-alpha"
+        addon._POLICY_PREVIEW_SESSION = addon._PolicyPreviewSession(
+            owner.name,
+            owner.as_pointer(),
+            bpy.context.scene.name,
+            mock.Mock(),
+            Path(tempfile.gettempdir()) / "policy-preview.npz",
+            FakePreviewProcess(),
+        )
+
+        calls = self.draw_panel()
+
+        self.assertIn(
+            (
+                "label",
+                {"text": "Another policy preview is running", "icon": "INFO"},
+                True,
+            ),
+            calls,
+        )
+        self.assertIn(
+            (
+                "operator",
+                {"id": "duck.generate_policy_preview", "icon": "FILE_REFRESH"},
+                False,
+            ),
+            calls,
+        )
+        self.assertNotIn(
+            (
+                "operator",
+                {"id": "duck.cancel_policy_preview", "icon": "CANCEL"},
+                True,
+            ),
+            calls,
         )
 
 
