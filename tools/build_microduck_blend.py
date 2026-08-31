@@ -10,7 +10,7 @@ from pathlib import Path
 import sys
 
 import bpy
-from mathutils import Vector
+from mathutils import Quaternion, Vector
 import numpy as np
 
 
@@ -108,6 +108,13 @@ def _organize_release_scene(armature, policy_motion: Path) -> None:
             if area.type == "VIEW_3D":
                 area.spaces.active.show_region_ui = True
                 area.spaces.active.shading.type = "MATERIAL"
+                region = area.spaces.active.region_3d
+                region.view_location = Vector((0.0, 0.0, 0.13))
+                region.view_distance = 0.44
+                region.view_rotation = Quaternion(
+                    (0.71237588, 0.44106209, 0.28735825, 0.46412292)
+                )
+                region.view_perspective = "PERSP"
     bpy.ops.object.mode_set(mode="OBJECT") if armature.mode != "OBJECT" else None
     bpy.ops.object.select_all(action="DESELECT")
     armature.select_set(True)

@@ -375,19 +375,18 @@ def approximate_mouth_linkage() -> MouthLinkage:
     opened = math.radians(30.0)
     # The public MJCF places the mouth servo and opposite bearing on a world-Y
     # line.  Their shared centre resolves to this point in jaw_soft local space.
-    # Blender edit-bone matrices express this parent-frame point with X/Y
-    # swapped and negated relative to the raw MJCF body coordinates.
+    # The jaw_soft local Y axis is the robot's world left-right hinge axis.
     pivot = (0.018, 0.0, -0.018)
 
     def pose(angle_from_closed: float) -> Pose:
         half = angle_from_closed / 2.0
-        return Pose(pivot, (math.cos(half), -math.sin(half), 0.0, 0.0))
+        return Pose(pivot, (math.cos(half), 0.0, math.sin(half), 0.0))
 
     definition = {
         "approximation_version": 1,
         "basis": "squad.webp visual reference plus canonical jaw STL coordinate frame",
         "pivot_m": pivot,
-        "axis": "jaw_soft local -X (world +Y at the neutral pose)",
+        "axis": "jaw_soft local +Y (world +Y at the neutral pose)",
         "meshes": ["jaw", "jaw_soft"],
     }
     link = MouthLink(

@@ -11,7 +11,7 @@ import sys
 import xml.etree.ElementTree as ET
 
 import bpy
-from mathutils import Matrix, Quaternion
+from mathutils import Matrix, Quaternion, Vector
 import numpy as np
 
 
@@ -247,6 +247,26 @@ def check_release() -> dict[str, int]:
         mouth_bone_name = f"mouth::{profile.mouth.links[0].name}"
         armature.duck_mouth_open = 0.0
         bpy.context.view_layer.update()
+        mouth_visuals = [
+            obj
+            for obj in visuals
+            if obj.data.name.removeprefix("mesh::").split("::", 1)[0]
+            in profile.mouth.links[0].meshes
+        ]
+        tip_candidates = [
+            (obj, Vector(corner), obj.matrix_world @ Vector(corner))
+            for obj in mouth_visuals
+            for corner in obj.bound_box
+        ]
+        front = max(point.x for _obj, _corner, point in tip_candidates)
+        mouth_tip = [
+            (obj, corner)
+            for obj, corner, point in tip_candidates
+            if point.x > front - 0.002
+        ]
+        closed_tip_height = sum(
+            (obj.matrix_world @ corner).z for obj, corner in mouth_tip
+        ) / len(mouth_tip)
         closed = tuple(
             tuple(row) for row in armature.pose.bones[mouth_bone_name].matrix_basis
         )
@@ -261,6 +281,11 @@ def check_release() -> dict[str, int]:
         _check_visual_matrices(
             profile, armature, visuals, _mouth_visual_poses(profile, 1.0)
         )
+        open_tip_height = sum(
+            (obj.matrix_world @ corner).z for obj, corner in mouth_tip
+        ) / len(mouth_tip)
+        if open_tip_height >= closed_tip_height - 0.002:
+            raise AssertionError("open mouth does not lower the front beak tip")
         if closed == opened:
             raise AssertionError("mouth control does not change the mouth helper pose")
         for key, (_label, shell_hex, trim_hex) in addon.COLORWAYS.items():
@@ -294,6 +319,8 @@ def check_release() -> dict[str, int]:
         raise AssertionError("release sidebar is not open")
     if any(space.shading.type != "MATERIAL" for space in view_spaces):
         raise AssertionError("release viewport is not material-visible")
+    if any(space.region_3d.view_distance >= 0.5 for space in view_spaces):
+        raise AssertionError("release viewport is not framed on Microduck")
     bootstrap = bpy.data.texts["open_duck_bootstrap.py"]
     namespace = {}
     exec(compile(bootstrap.as_string(), "<release-bootstrap>", "exec"), namespace)

@@ -734,6 +734,26 @@ class SceneBuilderTests(unittest.TestCase):
             open_pose.quaternion_wxyz
         ).to_matrix().to_4x4()
         mouth_meshes = set(link.meshes)
+        closed_tip_points = []
+        open_tip_points = []
+        for body_name, mesh_name, local in visual_specs:
+            if mesh_name not in mouth_meshes:
+                continue
+            body_world = armature.matrix_world @ armature.pose.bones[body_name].matrix
+            closed_matrix = body_world @ local
+            open_matrix = body_world @ opened @ closed.inverted() @ local
+            mesh = objects_by_mesh[mesh_name][0].data
+            closed_points = [closed_matrix @ vertex.co for vertex in mesh.vertices]
+            front = max(point.x for point in closed_points)
+            for vertex, point in zip(mesh.vertices, closed_points, strict=True):
+                if point.x > front - 0.002:
+                    closed_tip_points.append(point)
+                    open_tip_points.append(open_matrix @ vertex.co)
+        closed_tip_height = sum(point.z for point in closed_tip_points) / len(
+            closed_tip_points
+        )
+        open_tip_height = sum(point.z for point in open_tip_points) / len(open_tip_points)
+        self.assertLess(open_tip_height, closed_tip_height - 0.002)
         expected_by_mesh = {}
         for body_name, mesh_name, local in visual_specs:
             body_world = armature.matrix_world @ armature.pose.bones[body_name].matrix
