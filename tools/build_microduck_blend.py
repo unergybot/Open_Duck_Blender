@@ -94,6 +94,7 @@ def build(args: argparse.Namespace) -> Path:
         profile,
         args.policy_motion,
         action_name="Policy_alpha_walking_forward",
+        motion_kind="policy_rollout",
     )
     manifest = bpy.data.texts.get("microduck-build-manifest.json") or bpy.data.texts.new(
         "microduck-build-manifest.json"

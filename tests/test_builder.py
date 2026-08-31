@@ -562,12 +562,25 @@ class SceneBuilderTests(unittest.TestCase):
             joint_pos = np.zeros((51, 1), dtype=np.float32)
             joint_pos[25, 0] = 0.4
             body_pos = np.zeros((51, 3, 3), dtype=np.float32)
-            body_pos[:, :, 2] = 0.12
-            body_pos[:, 0, 0] = np.linspace(0.0, 0.5, 51)
+            root_x = np.linspace(0.0, 0.5, 51)
+            body_pos[:, 0] = np.column_stack(
+                (root_x, np.zeros(51), np.full(51, 0.12))
+            )
+            body_pos[:, 1] = np.column_stack(
+                (root_x + 0.1, np.zeros(51), np.full(51, 0.12))
+            )
+            body_pos[:, 2] = np.column_stack(
+                (root_x, np.zeros(51), np.full(51, 0.22))
+            )
+            body_quat = np.tile(
+                np.array([1.0, 0.0, 0.0, 0.0]), (51, 3, 1)
+            )
+            body_quat[:, 1, 0] = np.cos(joint_pos[:, 0] / 2.0)
+            body_quat[:, 1, 3] = np.sin(joint_pos[:, 0] / 2.0)
             archive = build_motion_archive(
                 joint_pos,
                 body_pos,
-                np.tile(np.array([1.0, 0.0, 0.0, 0.0]), (51, 3, 1)),
+                body_quat,
                 fps=50,
                 joint_names=profile.joint_names,
                 body_names=profile.body_names,
@@ -575,6 +588,7 @@ class SceneBuilderTests(unittest.TestCase):
                 source_hashes={"fixture": "deadbeef"},
             )
             np.savez_compressed(motion, **archive)
+            expected_source_sha256 = hashlib.sha256(motion.read_bytes()).hexdigest()
             armature = generate_microduck_scene(
                 profile,
                 mjcf,
@@ -584,7 +598,13 @@ class SceneBuilderTests(unittest.TestCase):
 
         self.assertEqual((bpy.context.scene.frame_start, bpy.context.scene.frame_end), (1, 51))
         self.assertIsNotNone(armature.animation_data)
-        self.assertEqual(armature.animation_data.action.name, "MicroduckCrouchTest")
+        self.assertEqual(armature.animation_data.action.name, "KinematicCrouchTest")
+        action = armature.animation_data.action
+        self.assertEqual(action["duck_motion_kind"], "kinematic_test")
+        self.assertEqual(action["duck_source_sha256"], expected_source_sha256)
+        self.assertFalse(action["duck_loopable"])
+        self.assertIn("duck_contact_valid", action)
+        self.assertFalse(action["duck_contact_valid"])
         bpy.context.scene.frame_set(26)
         self.assertAlmostEqual(armature.pose.bones["child"].rotation_euler.z, 0.4, places=6)
         self.assertAlmostEqual(armature.duck_mouth_open, 1.0, places=6)

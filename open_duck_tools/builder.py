@@ -328,12 +328,14 @@ def generate_microduck_scene(
     addon._apply_colorway(armature, "CREAM")
     _embed_addon(addon_source_root)
     if demo_motion_path is not None:
-        import_motion_action(
+        crouch_action = import_motion_action(
             armature,
             profile,
             Path(demo_motion_path),
-            action_name="MicroduckCrouchTest",
+            action_name="KinematicCrouchTest",
+            motion_kind="kinematic_test",
         )
+        crouch_action["duck_contact_valid"] = False
         _key_crouch_mouth_curve(armature, scene.frame_end)
         scene.frame_set(scene.frame_start)
     bpy.context.view_layer.objects.active = armature

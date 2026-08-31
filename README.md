@@ -211,10 +211,12 @@ active imported action again.
 
 Select the Microduck armature, press `N` while the mouse is over the 3D View,
 then open **Open Duck → Animation**. Choose any embedded action from the
-searchable **Action** field, or use **Walk** and **Crouch** for the included
-milestones. **Play/Pause** loops over that action's complete frame range, and
-**Reset** returns to its first frame. This is the simplest way to preview the
-robot; opening the Dope Sheet or Action Editor is optional.
+searchable **Action** field, or use **Walk** for the included policy milestone.
+The retained `KinematicCrouchTest` remains available through Action search but
+is not a beginner preset because it is not contact-valid. **Play Once** stops at
+the action's final frame, and **Reset** returns to its first frame. This is the
+simplest way to preview the robot; opening the Dope Sheet or Action Editor is
+optional.
 
 ### Policy walking milestone
 
@@ -229,8 +231,8 @@ alongside the policy and scene hashes.
 | --- | --- | --- |
 | ![Microduck policy walk at frame 1](assets/previews/microduck-policy-walk-start.png) | ![Microduck policy walk at frame 100](assets/previews/microduck-policy-walk-mid.png) | ![Microduck policy walk at frame 200](assets/previews/microduck-policy-walk-end.png) |
 
-`microduck-alpha.blend` includes a 51-frame neutral-to-crouch-to-neutral test
-action. Its verified export is stored at
+`microduck-alpha.blend` includes the 51-frame `KinematicCrouchTest`
+neutral-to-crouch-to-neutral action. Its verified export is stored at
 `assets/motions/microduck-crouch-test.npz`; the animated mouth is visual-only
 and remains outside the 14-joint policy archive.
 

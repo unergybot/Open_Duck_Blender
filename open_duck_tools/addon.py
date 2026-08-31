@@ -12,9 +12,12 @@ from mathutils import Matrix, Quaternion
 import numpy as np
 
 from .blender_bridge import (
+    MATRIX_RESIDUAL_TOLERANCE,
     body_samples,
     canonical_body_matrices,
+    force_fk,
     joint_angles_from_body_matrices,
+    matrix_residual,
 )
 from .motion import MotionError, build_motion_archive, save_motion_npz
 from .motion_import import import_motion_action
@@ -27,6 +30,7 @@ COLORWAYS = {
     "LAVENDER": ("Lavender", "#bfa9cf", "#f7c948"),
     "SKY": ("Sky", "#a9dbe8", "#f59e0b"),
 }
+BEGINNER_ACTION_PRESETS = (("Policy_alpha_walking_forward", "Walk"),)
 
 
 def _srgb_channel(value: int) -> float:
@@ -74,13 +78,27 @@ def collect_armature_motion(
     if frame_end < frame_start:
         raise MotionError("export frame end precedes frame start")
     scene = bpy.context.scene
+    fps_base = float(scene.render.fps_base)
+    effective_fps = (
+        float(scene.render.fps) / fps_base
+        if math.isfinite(fps_base) and fps_base > 0.0
+        else math.inf
+    )
+    if not math.isclose(effective_fps, 50.0, rel_tol=0.0, abs_tol=1e-9):
+        raise MotionError(
+            f"effective frame rate is {effective_fps:.12g} Hz; "
+            "Microduck motion export requires 50 Hz"
+        )
     original_frame = scene.frame_current
     joint_frames = []
     body_positions = []
     body_quaternions = []
     rest_matrices = _rest_body_matrices(armature, profile.body_names)
-    root_name = next(body.name for body in profile.bodies if body.parent is None)
-    root_spec = next(body for body in profile.bodies if body.name == root_name)
+    roots = tuple(body for body in profile.bodies if body.parent is None)
+    if len(roots) != 1:
+        raise MotionError(f"profile must contain exactly one root body, got {len(roots)}")
+    root_spec = roots[0]
+    root_name = root_spec.name
     root_mjcf_rest = Matrix.Translation(root_spec.position) @ Quaternion(
         root_spec.quaternion_wxyz
     ).to_matrix().to_4x4()
@@ -96,6 +114,22 @@ def collect_armature_motion(
                 @ root_mjcf_rest
             )
             canonical = canonical_body_matrices(root_world, angles, profile)
+            for body_name in profile.body_names:
+                position_m, rotation_rad, affine = matrix_residual(
+                    matrices[body_name], canonical[body_name]
+                )
+                if (
+                    position_m > MATRIX_RESIDUAL_TOLERANCE
+                    or rotation_rad > MATRIX_RESIDUAL_TOLERANCE
+                    or affine > MATRIX_RESIDUAL_TOLERANCE
+                ):
+                    raise MotionError(
+                        "evaluated body transform differs from canonical FK at "
+                        f"frame {frame}, body {body_name!r}: "
+                        f"position residual {position_m:.6g} m, "
+                        f"rotation residual {rotation_rad:.6g} rad, "
+                        f"affine residual {affine:.6g}"
+                    )
             positions, quaternions = body_samples(canonical, profile)
             body_positions.append(positions)
             body_quaternions.append(quaternions)
@@ -105,7 +139,7 @@ def collect_armature_motion(
         np.asarray(joint_frames),
         np.asarray(body_positions),
         np.asarray(body_quaternions),
-        fps=scene.render.fps,
+        fps=50,
         joint_names=profile.joint_names,
         body_names=profile.body_names,
         joint_ranges=tuple(joint.range_rad for joint in profile.joints),
@@ -258,13 +292,83 @@ def _default_motion_action_name(filepath: str) -> str:
     return sanitized or "ImportedMotion"
 
 
+def _clear_play_once_handlers(scene=None) -> None:
+    scene_pointer = scene.as_pointer() if scene is not None else None
+    for handler in tuple(bpy.app.handlers.frame_change_post):
+        if not getattr(handler, "_duck_play_once_handler", False):
+            continue
+        if scene_pointer is not None and getattr(
+            handler, "_duck_scene_pointer", None
+        ) != scene_pointer:
+            continue
+        bpy.app.handlers.frame_change_post.remove(handler)
+
+
+def _stop_playback(context) -> None:
+    screen = getattr(context, "screen", None)
+    if screen is not None and screen.is_animation_playing:
+        bpy.ops.screen.animation_cancel(restore_frame=False)
+    scene = getattr(context, "scene", None)
+    _clear_play_once_handlers(scene)
+
+
+def _action_range(action) -> tuple[int, int]:
+    if action.use_frame_range:
+        start, end = action.frame_start, action.frame_end
+    else:
+        start, end = action.frame_range
+    return math.floor(start), math.ceil(end)
+
+
+def _set_action_scene_range(scene, action) -> tuple[int, int]:
+    start, end = _action_range(action)
+    scene.frame_start = start
+    scene.frame_end = end
+    scene.use_preview_range = False
+    return start, end
+
+
+def _is_loopable(action) -> bool:
+    return bool(action.get("duck_loopable", True))
+
+
+def _install_play_once_handler(scene) -> None:
+    _clear_play_once_handlers(scene)
+    scene_pointer = scene.as_pointer()
+    end_frame = scene.frame_end
+
+    def stop_at_end(changed_scene, *_args):
+        if changed_scene.as_pointer() != scene_pointer:
+            return
+        if changed_scene.frame_current < end_frame:
+            return
+        screen = bpy.context.screen
+        if screen is not None and screen.is_animation_playing:
+            bpy.ops.screen.animation_cancel(restore_frame=False)
+        _clear_play_once_handlers(changed_scene)
+
+    stop_at_end._duck_play_once_handler = True
+    stop_at_end._duck_scene_pointer = scene_pointer
+    bpy.app.handlers.frame_change_post.append(stop_at_end)
+
+
+def _configure_action_playback(scene, action) -> None:
+    _clear_play_once_handlers(scene)
+    if hasattr(scene, "playback_loop_mode"):
+        scene.playback_loop_mode = (
+            "INFINITE" if _is_loopable(action) else "STOP_END_FRAME"
+        )
+    elif not _is_loopable(action):
+        _install_play_once_handler(scene)
+
+
 def _activate_action(armature, action, scene) -> None:
+    force_fk(armature)
+    _stop_playback(bpy.context)
     armature.animation_data_create()
     armature.animation_data.action = action
-    start, end = action.frame_range
-    scene.frame_start = math.floor(start)
-    scene.frame_end = math.ceil(end)
-    scene.frame_set(scene.frame_start)
+    start, _end = _set_action_scene_range(scene, action)
+    scene.frame_set(start)
 
 
 def _action_name_get(armature) -> str:
@@ -300,8 +404,8 @@ class DUCK_OT_select_action(bpy.types.Operator):
 
 class DUCK_OT_toggle_animation(bpy.types.Operator):
     bl_idname = "duck.toggle_animation"
-    bl_label = "Play/Pause"
-    bl_description = "Play or pause the active animation over its frame range"
+    bl_label = "Play Once/Pause"
+    bl_description = "Play a non-looping action once, or pause the active animation"
 
     def execute(self, context):
         armature = context.object
@@ -313,14 +417,14 @@ class DUCK_OT_toggle_animation(bpy.types.Operator):
             self.report({"WARNING"}, "Select an animation action first")
             return {"CANCELLED"}
         if context.screen.is_animation_playing:
-            bpy.ops.screen.animation_cancel(restore_frame=False)
+            _stop_playback(context)
         else:
-            if not (
-                context.scene.frame_start
-                <= context.scene.frame_current
-                <= context.scene.frame_end
-            ):
-                context.scene.frame_set(context.scene.frame_start)
+            action = armature.animation_data.action
+            force_fk(armature)
+            start, end = _set_action_scene_range(context.scene, action)
+            if context.scene.frame_current < start or context.scene.frame_current >= end:
+                context.scene.frame_set(start)
+            _configure_action_playback(context.scene, action)
             bpy.ops.screen.animation_play()
         return {"FINISHED"}
 
@@ -331,9 +435,19 @@ class DUCK_OT_reset_animation(bpy.types.Operator):
     bl_description = "Pause and return to the first animation frame"
 
     def execute(self, context):
-        if context.screen.is_animation_playing:
-            bpy.ops.screen.animation_cancel(restore_frame=False)
-        context.scene.frame_set(context.scene.frame_start)
+        armature = context.object
+        action = (
+            armature.animation_data.action
+            if armature is not None and armature.animation_data is not None
+            else None
+        )
+        if action is not None:
+            force_fk(armature)
+            start, _end = _set_action_scene_range(context.scene, action)
+        else:
+            start = context.scene.frame_start
+        _stop_playback(context)
+        context.scene.frame_set(start)
         return {"FINISHED"}
 
 
@@ -358,8 +472,10 @@ class DUCK_OT_import_motion(bpy.types.Operator, ImportHelper):
                 profile,
                 Path(self.filepath),
                 action_name=action_name,
+                before_mutation=lambda: _stop_playback(context),
             )
         except (MotionError, ProfileError, OSError, ValueError) as exc:
+            _stop_playback(context)
             self.report({"WARNING"}, str(exc))
             return {"CANCELLED"}
         frame_count = context.scene.frame_end - context.scene.frame_start + 1
@@ -424,10 +540,7 @@ class DUCK_PT_tools(bpy.types.Panel):
             text="Action",
         )
         presets = animation.row(align=True)
-        for action_name, label in (
-            ("Policy_alpha_walking_forward", "Walk"),
-            ("MicroduckCrouchTest", "Crouch"),
-        ):
+        for action_name, label in BEGINNER_ACTION_PRESETS:
             if bpy.data.actions.get(action_name) is not None:
                 operator = presets.operator("duck.select_action", text=label)
                 operator.action_name = action_name
@@ -436,7 +549,15 @@ class DUCK_PT_tools(bpy.types.Panel):
         controls.enabled = bool(active_action)
         controls.operator(
             "duck.toggle_animation",
-            text="Pause" if context.screen.is_animation_playing else "Play",
+            text=(
+                "Pause"
+                if context.screen.is_animation_playing
+                else (
+                    "Play"
+                    if active_action and _is_loopable(active_action)
+                    else "Play Once"
+                )
+            ),
             icon="PAUSE" if context.screen.is_animation_playing else "PLAY",
         )
         controls.operator("duck.reset_animation", text="Reset", icon="LOOP_BACK")
@@ -466,6 +587,7 @@ CLASSES = (
 
 
 def register():
+    _clear_play_once_handlers()
     for cls in CLASSES:
         if not hasattr(bpy.types, cls.__name__):
             bpy.utils.register_class(cls)
@@ -493,6 +615,8 @@ def register():
 
 
 def unregister():
+    _stop_playback(bpy.context)
+    _clear_play_once_handlers()
     if hasattr(bpy.types.Object, "duck_action_name"):
         del bpy.types.Object.duck_action_name
     if hasattr(bpy.types.Object, "duck_mouth_open"):

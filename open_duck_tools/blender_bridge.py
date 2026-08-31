@@ -8,6 +8,44 @@ from mathutils import Matrix, Quaternion, Vector
 import numpy as np
 
 
+MATRIX_RESIDUAL_TOLERANCE = 1e-5
+
+
+def matrix_residual(actual: Matrix, expected: Matrix) -> tuple[float, float, float]:
+    """Return translation, sign-invariant rotation, and affine residuals."""
+    position_m = float((actual.to_translation() - expected.to_translation()).length)
+    actual_rotation = actual.to_quaternion().normalized()
+    expected_rotation = expected.to_quaternion().normalized()
+    relative = expected_rotation.conjugated() @ actual_rotation
+    relative.normalize()
+    vector_length = math.sqrt(
+        relative.x * relative.x
+        + relative.y * relative.y
+        + relative.z * relative.z
+    )
+    rotation_rad = 2.0 * math.atan2(vector_length, abs(relative.w))
+
+    def deformation(matrix: Matrix, rotation: Quaternion) -> float:
+        basis = np.asarray(matrix.to_3x3(), dtype=np.float64)
+        rigid = np.asarray(rotation.to_matrix(), dtype=np.float64)
+        return float(np.max(np.abs(basis - rigid)))
+
+    affine = max(
+        deformation(actual, actual_rotation),
+        deformation(expected, expected_rotation),
+    )
+    return position_m, rotation_rad, affine
+
+
+def force_fk(armature) -> None:
+    """Disable Duck IK directly without baking the evaluated IK pose."""
+    for pose_bone in armature.pose.bones:
+        for constraint in pose_bone.constraints:
+            if constraint.name.startswith("DUCK_IK"):
+                constraint.influence = 0.0
+    armature["fk_ik"] = 0.0
+
+
 def _rest_matrix(body) -> Matrix:
     return Matrix.Translation(body.position) @ Quaternion(body.quaternion_wxyz).to_matrix().to_4x4()
 

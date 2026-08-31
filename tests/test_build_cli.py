@@ -1,4 +1,5 @@
 from contextlib import redirect_stderr
+import hashlib
 import importlib.util
 import io
 import json
@@ -10,13 +11,13 @@ from unittest import mock
 from pathlib import Path
 
 import bpy
+import numpy as np
 
-from open_duck_tools.motion import MotionError
+from open_duck_tools.motion import MotionError, build_motion_archive
 from open_duck_tools.profile import ProfileError
 
 
 SCRIPT = Path(__file__).parents[1] / "tools" / "build_microduck_blend.py"
-POLICY_SHA256 = "822a1fbde45f31c7b703d09a225115f430672fd0ba4873d97201b35832348b54"
 JOINT_NAMES = (
     "left_hip_yaw",
     "left_hip_roll",
@@ -117,6 +118,28 @@ def write_controlled_build_sources(root: Path) -> None:
     )
 
 
+def write_controlled_motion(path: Path, frame_count: int, travel: float) -> str:
+    root_x = np.linspace(0.0, travel, frame_count)
+    body_pos = np.zeros((frame_count, len(BODY_NAMES), 3), dtype=np.float64)
+    body_pos[:, :, 0] = root_x[:, None]
+    body_pos[:, :, 2] = 0.12
+    archive = build_motion_archive(
+        np.zeros((frame_count, len(JOINT_NAMES)), dtype=np.float64),
+        body_pos,
+        np.tile(
+            np.array([1.0, 0.0, 0.0, 0.0]),
+            (frame_count, len(BODY_NAMES), 1),
+        ),
+        fps=50,
+        joint_names=JOINT_NAMES,
+        body_names=BODY_NAMES,
+        joint_ranges=tuple((-10.0, 10.0) for _name in JOINT_NAMES),
+        source_hashes={"fixture": "controlled"},
+    )
+    np.savez_compressed(path, **archive)
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 class BuildCliTests(unittest.TestCase):
     def test_defaults_to_explicit_approximate_mouth_mode(self):
         args = MODULE._arguments([])
@@ -142,38 +165,55 @@ class BuildCliTests(unittest.TestCase):
             root = Path(directory)
             output = root / "microduck-alpha.blend"
             write_controlled_build_sources(root)
+            demo_motion = root / "controlled-crouch.npz"
+            policy_motion = root / "controlled-policy.npz"
+            demo_sha256 = write_controlled_motion(demo_motion, 51, 0.0)
+            policy_sha256 = write_controlled_motion(policy_motion, 200, 0.5)
             args = MODULE._arguments(
                 [
                     "--runtime-root",
                     str(root / "runtime"),
                     "--rl-root",
                     str(root / "rl"),
+                    "--demo-motion",
+                    str(demo_motion),
+                    "--policy-motion",
+                    str(policy_motion),
                     "--output",
                     str(output),
                 ]
             )
             try:
                 MODULE.build(args)
-            except ProfileError as exc:
+            except (ProfileError, MotionError) as exc:
                 self.fail(f"controlled build roots were not portable: {exc}")
             bpy.ops.wm.open_mainfile(filepath=str(output))
 
             self.assertEqual(
                 {action.name for action in bpy.data.actions},
-                {"MicroduckCrouchTest", "Policy_alpha_walking_forward"},
+                {"KinematicCrouchTest", "Policy_alpha_walking_forward"},
             )
-            self.assertTrue(bpy.data.actions["MicroduckCrouchTest"].use_fake_user)
+            crouch = bpy.data.actions["KinematicCrouchTest"]
+            policy = bpy.data.actions["Policy_alpha_walking_forward"]
+            self.assertTrue(crouch.use_fake_user)
             self.assertTrue(
-                bpy.data.actions["Policy_alpha_walking_forward"].use_fake_user
+                policy.use_fake_user
             )
             self.assertEqual(
-                tuple(bpy.data.actions["MicroduckCrouchTest"].frame_range),
+                tuple(crouch.frame_range),
                 (1.0, 51.0),
             )
             self.assertEqual(
-                tuple(bpy.data.actions["Policy_alpha_walking_forward"].frame_range),
+                tuple(policy.frame_range),
                 (1.0, 200.0),
             )
+            self.assertEqual(crouch["duck_motion_kind"], "kinematic_test")
+            self.assertEqual(crouch["duck_source_sha256"], demo_sha256)
+            self.assertFalse(crouch["duck_loopable"])
+            self.assertFalse(crouch["duck_contact_valid"])
+            self.assertEqual(policy["duck_motion_kind"], "policy_rollout")
+            self.assertEqual(policy["duck_source_sha256"], policy_sha256)
+            self.assertFalse(policy["duck_loopable"])
             self.assertEqual(bpy.context.scene.render.fps, 50)
             self.assertEqual(bpy.context.scene.render.fps_base, 1.0)
             self.assertEqual(
@@ -192,7 +232,7 @@ class BuildCliTests(unittest.TestCase):
             manifest = json.loads(
                 bpy.data.texts["microduck-build-manifest.json"].as_string()
             )
-            self.assertEqual(manifest["policy_motion_sha256"], POLICY_SHA256)
+            self.assertEqual(manifest["policy_motion_sha256"], policy_sha256)
 
     def test_reports_all_missing_canonical_sources_before_build(self):
         with tempfile.TemporaryDirectory() as directory:
