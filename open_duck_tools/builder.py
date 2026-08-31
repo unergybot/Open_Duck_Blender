@@ -93,6 +93,7 @@ def _embed_addon(addon_source_root: Path) -> None:
         "blender_bridge",
         "motion_import",
         "ik",
+        "policy_preview",
         "addon",
     )
     for name in module_names:
@@ -106,7 +107,7 @@ def _embed_addon(addon_source_root: Path) -> None:
         text.write(path.read_text())
     bootstrap_source = '''import bpy, sys, types
 
-MODULES = ("profile", "motion", "blender_bridge", "motion_import", "ik", "addon")
+MODULES = ("profile", "motion", "blender_bridge", "motion_import", "ik", "policy_preview", "addon")
 PACKAGE = "open_duck_tools_embedded"
 
 def register():

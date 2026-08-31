@@ -210,6 +210,23 @@ and sets the scene to the archive frame range at 50 Hz. Importing never changes
 14-joint policy archive. Use **Open Duck → Export mjlab Motion** to export the
 active imported action again.
 
+### Generate a policy preview in Blender
+
+Generating a new preview requires `uv`, `~/MyCode/microduck`, and
+`~/MyCode/microduck_rl`. Normal playback of existing actions remains
+self-contained.
+
+1. Select `MicroduckRig` and open `N` → **Open Duck**.
+2. Find **Generate Policy Preview** in the sidebar.
+3. Keep `alpha_walking.onnx` or choose another compatible walking policy.
+4. Set **Forward/Lateral/Yaw**, **Duration**, and **Seed**.
+5. Press **Generate & Import**; continue using Blender or press **Cancel**.
+6. The new `PolicyWalk_*` action becomes active when validation succeeds.
+
+Exact configurations can reuse a validated archive from the user cache. Every
+click still creates a new action, including when the rollout comes from that
+cache.
+
 ### Play an animation without the Action Editor
 
 Select the Microduck armature, press `N` while the mouse is over the 3D View,

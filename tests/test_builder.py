@@ -171,9 +171,11 @@ class SceneBuilderTests(unittest.TestCase):
         self.assertIn("mouth::lower_beak", armature.data.bones)
         self.assertIsNotNone(bpy.data.objects.get("visual::jaw"))
         self.assertTrue(armature.data.get("duck_robot_profile_json"))
+        self.assertIsNotNone(bpy.data.texts.get("open_duck_tools.policy_preview"))
         bootstrap = bpy.data.texts.get("open_duck_bootstrap.py")
         self.assertIsNotNone(bootstrap)
         self.assertTrue(bootstrap.use_module)
+        self.assertIn('"policy_preview"', bootstrap.as_string())
         self.assertEqual(bootstrap.as_string().rstrip().splitlines()[-1], "register()")
         addon.unregister()
         first_bootstrap = {}
@@ -192,6 +194,10 @@ class SceneBuilderTests(unittest.TestCase):
             self.assertIs(bpy.types.DUCK_PT_tools, second_addon.DUCK_PT_tools)
             self.assertTrue(hasattr(bpy.types.Object, "duck_action_name"))
             self.assertTrue(hasattr(bpy.types, "DUCK_OT_toggle_animation"))
+            self.assertIs(
+                bpy.types.DUCK_OT_generate_policy_preview,
+                second_addon.DUCK_OT_generate_policy_preview,
+            )
         finally:
             registered = getattr(bpy.types, "DUCK_PT_tools", None)
             current_addon = sys.modules.get("open_duck_tools_embedded.addon")
