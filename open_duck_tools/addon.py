@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import atexit
+from dataclasses import dataclass
+import json
 import math
+import os
 from pathlib import Path
 import re
 
@@ -22,7 +26,15 @@ from .blender_bridge import (
 )
 from .ik import leg_kinematics, solve_leg_ik
 from .motion import MotionError, build_motion_archive, save_motion_npz
-from .motion_import import import_motion_action
+from .motion_import import import_motion_action, load_motion
+from .policy_preview import (
+    PolicyPreviewError,
+    PreviewConfig,
+    PreviewProcess,
+    ValidatedPreview,
+    temporary_output_path,
+    validate_preview_config,
+)
 from .profile import ProfileError, profile_from_json
 
 
@@ -34,6 +46,21 @@ COLORWAYS = {
 }
 BEGINNER_ACTION_PRESETS = (("Policy_alpha_walking_forward", "Walk"),)
 _IK_UPDATE_GUARD: set[int] = set()
+
+
+@dataclass
+class _PolicyPreviewSession:
+    armature_name: str
+    armature_pointer: int
+    scene_name: str
+    validated: ValidatedPreview
+    output_path: Path
+    process: PreviewProcess
+
+
+_POLICY_PREVIEW_SESSION: _PolicyPreviewSession | None = None
+_POLICY_PREVIEW_TIMER_INTERVAL = 0.1
+_POLICY_PREVIEW_DETAILS_LIMIT = 2048
 
 
 def _srgb_channel(value: int) -> float:
@@ -618,6 +645,319 @@ class DUCK_OT_import_motion(bpy.types.Operator, ImportHelper):
         return {"FINISHED"}
 
 
+def _is_profiled_microduck(armature) -> bool:
+    return bool(
+        armature is not None
+        and armature.type == "ARMATURE"
+        and armature.data is not None
+        and armature.data.get("duck_robot_profile_json")
+    )
+
+
+def _bounded_policy_preview_details(value) -> str:
+    return str(value).strip()[-_POLICY_PREVIEW_DETAILS_LIMIT:]
+
+
+def _resolve_policy_preview_armature(session: _PolicyPreviewSession):
+    armature = bpy.data.objects.get(session.armature_name)
+    if armature is None or armature.as_pointer() != session.armature_pointer:
+        return None
+    return armature
+
+
+def _validate_policy_preview_archive(path, profile, validated):
+    motion = load_motion(path, profile)
+    if motion.frames != validated.frames:
+        raise MotionError(
+            f"policy preview has {motion.frames} frames, expected {validated.frames}"
+        )
+    with np.load(path, allow_pickle=False) as archive:
+        source_hashes = json.loads(str(archive["source_hashes_json"][0]))
+    if source_hashes.get("policy_sha256") != validated.policy_sha256:
+        raise MotionError("policy preview archive has the wrong policy SHA-256")
+    if (
+        source_hashes.get("rollout_config_sha256")
+        != validated.rollout_config_sha256
+    ):
+        raise MotionError("policy preview archive has the wrong rollout configuration")
+    return motion
+
+
+def _import_policy_preview(session: _PolicyPreviewSession, path):
+    armature = _resolve_policy_preview_armature(session)
+    if armature is None:
+        raise ProfileError("the policy preview armature is no longer available")
+    profile = profile_from_armature(armature)
+    armature.duck_policy_status = "Validating"
+    source_path = Path(path)
+    motion = _validate_policy_preview_archive(
+        source_path, profile, session.validated
+    )
+    if source_path != session.validated.cache_path:
+        os.replace(source_path, session.validated.cache_path)
+    armature.duck_policy_status = "Importing"
+    action = import_motion_action(
+        armature,
+        profile,
+        session.validated.cache_path,
+        action_name=session.validated.action_name,
+        motion_kind="policy_preview",
+        before_mutation=lambda: _stop_playback(bpy.context),
+    )
+    action["duck_policy_preview_cache_key"] = session.validated.cache_key
+    armature.duck_policy_status = f"Imported {action.name} ({motion.frames} frames)"
+    armature.duck_policy_details = ""
+    return action
+
+
+def _ensure_policy_preview_timer() -> None:
+    if not bpy.app.timers.is_registered(_poll_policy_preview_job):
+        bpy.app.timers.register(
+            _poll_policy_preview_job,
+            first_interval=_POLICY_PREVIEW_TIMER_INTERVAL,
+        )
+
+
+def _clear_policy_preview_job(*, force=True) -> None:
+    global _POLICY_PREVIEW_SESSION
+    session = _POLICY_PREVIEW_SESSION
+    _POLICY_PREVIEW_SESSION = None
+    if force and bpy.app.timers.is_registered(_poll_policy_preview_job):
+        bpy.app.timers.unregister(_poll_policy_preview_job)
+    if session is None:
+        return
+    try:
+        session.process.close(force=force)
+    except Exception:
+        pass
+    try:
+        session.output_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _poll_policy_preview_job():
+    session = _POLICY_PREVIEW_SESSION
+    if session is None:
+        return None
+    armature = _resolve_policy_preview_armature(session)
+    if armature is None:
+        _clear_policy_preview_job(force=True)
+        return None
+    outcome = session.process.poll()
+    if outcome is None:
+        return _POLICY_PREVIEW_TIMER_INTERVAL
+    if outcome.cancelled:
+        armature.duck_policy_status = "Cancelled"
+        armature.duck_policy_details = _bounded_policy_preview_details(
+            outcome.log_tail
+        )
+        _clear_policy_preview_job(force=False)
+        return None
+    if outcome.returncode != 0:
+        armature.duck_policy_status = "Policy preview failed"
+        armature.duck_policy_details = _bounded_policy_preview_details(
+            outcome.log_tail or f"Policy rollout exited with code {outcome.returncode}"
+        )
+        _clear_policy_preview_job(force=False)
+        return None
+    try:
+        _import_policy_preview(session, session.output_path)
+    except (
+        MotionError,
+        ProfileError,
+        OSError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as exc:
+        armature.duck_policy_status = "Policy preview failed"
+        armature.duck_policy_details = _bounded_policy_preview_details(exc)
+    _clear_policy_preview_job(force=False)
+    return None
+
+
+def _resolved_blender_path(value: str) -> Path:
+    expanded = os.path.expandvars(bpy.path.abspath(value))
+    return Path(expanded).expanduser().resolve()
+
+
+def _policy_preview_cache_root() -> Path:
+    try:
+        return Path(
+            bpy.utils.user_resource(
+                "CACHE", path="open_duck/policy_previews", create=True
+            )
+        ).resolve()
+    except ValueError:
+        version = f"{bpy.app.version[0]}.{bpy.app.version[1]}"
+        cache_home = Path(
+            os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")
+        ).expanduser()
+        cache_root = cache_home / "blender" / version / "open_duck/policy_previews"
+        cache_root.mkdir(parents=True, exist_ok=True)
+        return cache_root.resolve()
+
+
+def _start_policy_preview(armature, context):
+    global _POLICY_PREVIEW_SESSION
+    if not _is_profiled_microduck(armature):
+        return {"CANCELLED"}
+    if _POLICY_PREVIEW_SESSION is not None:
+        return {"CANCELLED"}
+
+    output_path = None
+    process = None
+    armature.duck_policy_status = "Preflight"
+    armature.duck_policy_details = ""
+    try:
+        profile = profile_from_armature(armature)
+        cache_root = _policy_preview_cache_root()
+        config = PreviewConfig(
+            microduck_root=_resolved_blender_path(armature.duck_microduck_root),
+            microduck_rl_root=_resolved_blender_path(
+                armature.duck_microduck_rl_root
+            ),
+            policy_path=_resolved_blender_path(armature.duck_policy_path),
+            command=(
+                armature.duck_policy_forward,
+                armature.duck_policy_lateral,
+                armature.duck_policy_yaw,
+            ),
+            duration_s=armature.duck_policy_duration,
+            seed=armature.duck_policy_seed,
+            cache_root=cache_root,
+        )
+        validated = validate_preview_config(config)
+        if validated.cache_path.exists():
+            try:
+                _validate_policy_preview_archive(
+                    validated.cache_path, profile, validated
+                )
+            except (
+                MotionError,
+                OSError,
+                ValueError,
+                json.JSONDecodeError,
+            ):
+                validated.cache_path.unlink()
+            else:
+                cached_session = _PolicyPreviewSession(
+                    armature.name,
+                    armature.as_pointer(),
+                    context.scene.name,
+                    validated,
+                    validated.cache_path,
+                    None,
+                )
+                _import_policy_preview(cached_session, validated.cache_path)
+                return {"FINISHED"}
+
+        output_path = temporary_output_path(validated)
+        process = PreviewProcess.start(validated, output_path)
+        _POLICY_PREVIEW_SESSION = _PolicyPreviewSession(
+            armature.name,
+            armature.as_pointer(),
+            context.scene.name,
+            validated,
+            output_path,
+            process,
+        )
+        armature.duck_policy_status = "Exporting"
+        _ensure_policy_preview_timer()
+        return {"FINISHED"}
+    except Exception as exc:
+        if _POLICY_PREVIEW_SESSION is not None:
+            _clear_policy_preview_job(force=True)
+        elif process is not None:
+            try:
+                process.close(force=True)
+            except Exception:
+                pass
+        if output_path is not None:
+            try:
+                output_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        _POLICY_PREVIEW_SESSION = None
+        armature.duck_policy_status = "Policy preview failed"
+        armature.duck_policy_details = _bounded_policy_preview_details(exc)
+        return {"CANCELLED"}
+
+
+class DUCK_OT_generate_policy_preview(bpy.types.Operator):
+    bl_idname = "duck.generate_policy_preview"
+    bl_label = "Generate Policy Preview"
+    bl_description = "Generate and import a walking preview from an ONNX policy"
+
+    @classmethod
+    def poll(cls, context):
+        return _is_profiled_microduck(context.object)
+
+    def execute(self, context):
+        result = _start_policy_preview(context.object, context)
+        if result == {"CANCELLED"}:
+            self.report({"WARNING"}, "Policy preview could not be started")
+        return result
+
+
+class DUCK_OT_cancel_policy_preview(bpy.types.Operator):
+    bl_idname = "duck.cancel_policy_preview"
+    bl_label = "Cancel Policy Preview"
+    bl_description = "Cancel the running policy preview export"
+
+    @classmethod
+    def poll(cls, context):
+        return (
+            _POLICY_PREVIEW_SESSION is not None
+            and _is_profiled_microduck(context.object)
+        )
+
+    def execute(self, _context):
+        session = _POLICY_PREVIEW_SESSION
+        if session is None:
+            return {"CANCELLED"}
+        armature = _resolve_policy_preview_armature(session)
+        if armature is None:
+            _clear_policy_preview_job(force=True)
+            return {"CANCELLED"}
+        if armature.duck_policy_status != "Cancelling":
+            session.process.request_cancel()
+            armature.duck_policy_status = "Cancelling"
+        return {"FINISHED"}
+
+
+@bpy.app.handlers.persistent
+def _policy_preview_load_pre_handler(*_args) -> None:
+    _clear_policy_preview_job(force=True)
+
+
+_policy_preview_load_pre_handler._duck_policy_preview_handler = True
+
+
+def _clear_policy_preview_handlers() -> None:
+    for handler in tuple(bpy.app.handlers.load_pre):
+        if getattr(handler, "_duck_policy_preview_handler", False):
+            bpy.app.handlers.load_pre.remove(handler)
+
+
+def _atexit_policy_preview_cleanup() -> None:
+    global _POLICY_PREVIEW_SESSION
+    session = _POLICY_PREVIEW_SESSION
+    _POLICY_PREVIEW_SESSION = None
+    if session is not None:
+        try:
+            session.process.close(force=True)
+        except Exception:
+            pass
+
+
+def _install_policy_preview_cleanup_hooks() -> None:
+    _clear_policy_preview_handlers()
+    bpy.app.handlers.load_pre.append(_policy_preview_load_pre_handler)
+    atexit.unregister(_atexit_policy_preview_cleanup)
+    atexit.register(_atexit_policy_preview_cleanup)
+
+
 class DUCK_OT_export_motion(bpy.types.Operator, ExportHelper):
     bl_idname = "duck.export_motion"
     bl_label = "Export mjlab Motion"
@@ -725,6 +1065,8 @@ CLASSES = (
     DUCK_OT_toggle_animation,
     DUCK_OT_reset_animation,
     DUCK_OT_import_motion,
+    DUCK_OT_generate_policy_preview,
+    DUCK_OT_cancel_policy_preview,
     DUCK_OT_export_motion,
     DUCK_PT_tools,
 )
@@ -734,6 +1076,7 @@ def register():
     _clear_play_once_handlers()
     _clear_native_playback_handlers()
     _install_physical_ik_handlers()
+    _install_policy_preview_cleanup_hooks()
     for cls in CLASSES:
         if not hasattr(bpy.types, cls.__name__):
             bpy.utils.register_class(cls)
@@ -758,14 +1101,104 @@ def register():
             get=_action_name_get,
             set=_action_name_set,
         )
+    if not hasattr(bpy.types.Object, "duck_microduck_root"):
+        bpy.types.Object.duck_microduck_root = bpy.props.StringProperty(
+            name="microduck checkout",
+            subtype="DIR_PATH",
+            default=str(Path.home() / "MyCode/microduck"),
+        )
+    if not hasattr(bpy.types.Object, "duck_microduck_rl_root"):
+        bpy.types.Object.duck_microduck_rl_root = bpy.props.StringProperty(
+            name="microduck_rl checkout",
+            subtype="DIR_PATH",
+            default=str(Path.home() / "MyCode/microduck_rl"),
+        )
+    if not hasattr(bpy.types.Object, "duck_policy_path"):
+        bpy.types.Object.duck_policy_path = bpy.props.StringProperty(
+            name="Walking policy",
+            subtype="FILE_PATH",
+            default=str(Path.home() / "MyCode/microduck/policies/alpha_walking.onnx"),
+        )
+    if not hasattr(bpy.types.Object, "duck_policy_forward"):
+        bpy.types.Object.duck_policy_forward = bpy.props.FloatProperty(
+            name="Forward",
+            default=0.30,
+            unit="VELOCITY",
+        )
+    if not hasattr(bpy.types.Object, "duck_policy_lateral"):
+        bpy.types.Object.duck_policy_lateral = bpy.props.FloatProperty(
+            name="Lateral",
+            default=0.0,
+            unit="VELOCITY",
+        )
+    if not hasattr(bpy.types.Object, "duck_policy_yaw"):
+        bpy.types.Object.duck_policy_yaw = bpy.props.FloatProperty(
+            name="Yaw rate",
+            default=0.0,
+            unit="ROTATION",
+        )
+    if not hasattr(bpy.types.Object, "duck_policy_duration"):
+        bpy.types.Object.duck_policy_duration = bpy.props.FloatProperty(
+            name="Duration",
+            default=4.0,
+            min=0.02,
+            unit="TIME",
+        )
+    if not hasattr(bpy.types.Object, "duck_policy_seed"):
+        bpy.types.Object.duck_policy_seed = bpy.props.IntProperty(
+            name="Seed",
+            default=0,
+        )
+    if not hasattr(bpy.types.Object, "duck_policy_setup_open"):
+        bpy.types.Object.duck_policy_setup_open = bpy.props.BoolProperty(
+            name="Setup",
+            default=False,
+        )
+    if not hasattr(bpy.types.Object, "duck_policy_status"):
+        bpy.types.Object.duck_policy_status = bpy.props.StringProperty(
+            name="Policy preview status",
+            default="Idle",
+            options={"SKIP_SAVE"},
+        )
+    if not hasattr(bpy.types.Object, "duck_policy_details"):
+        bpy.types.Object.duck_policy_details = bpy.props.StringProperty(
+            name="Policy preview details",
+            default="",
+            options={"SKIP_SAVE"},
+        )
 
 
 def unregister():
+    _clear_policy_preview_job(force=True)
+    _clear_policy_preview_handlers()
+    atexit.unregister(_atexit_policy_preview_cleanup)
     _stop_playback(bpy.context)
     _clear_play_once_handlers()
     _clear_native_playback_handlers()
     _clear_physical_ik_handlers()
     _IK_UPDATE_GUARD.clear()
+    if hasattr(bpy.types.Object, "duck_policy_details"):
+        del bpy.types.Object.duck_policy_details
+    if hasattr(bpy.types.Object, "duck_policy_status"):
+        del bpy.types.Object.duck_policy_status
+    if hasattr(bpy.types.Object, "duck_policy_setup_open"):
+        del bpy.types.Object.duck_policy_setup_open
+    if hasattr(bpy.types.Object, "duck_policy_seed"):
+        del bpy.types.Object.duck_policy_seed
+    if hasattr(bpy.types.Object, "duck_policy_duration"):
+        del bpy.types.Object.duck_policy_duration
+    if hasattr(bpy.types.Object, "duck_policy_yaw"):
+        del bpy.types.Object.duck_policy_yaw
+    if hasattr(bpy.types.Object, "duck_policy_lateral"):
+        del bpy.types.Object.duck_policy_lateral
+    if hasattr(bpy.types.Object, "duck_policy_forward"):
+        del bpy.types.Object.duck_policy_forward
+    if hasattr(bpy.types.Object, "duck_policy_path"):
+        del bpy.types.Object.duck_policy_path
+    if hasattr(bpy.types.Object, "duck_microduck_rl_root"):
+        del bpy.types.Object.duck_microduck_rl_root
+    if hasattr(bpy.types.Object, "duck_microduck_root"):
+        del bpy.types.Object.duck_microduck_root
     if hasattr(bpy.types.Object, "duck_action_name"):
         del bpy.types.Object.duck_action_name
     if hasattr(bpy.types.Object, "duck_mouth_open"):

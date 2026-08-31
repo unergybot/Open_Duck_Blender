@@ -1,4 +1,5 @@
 import math
+import json
 import unittest
 from pathlib import Path
 import tempfile
@@ -11,6 +12,11 @@ from mathutils import Matrix
 from open_duck_tools import addon
 from open_duck_tools.motion import MotionError
 from open_duck_tools.motion_import import import_motion_action
+from open_duck_tools.policy_preview import (
+    ProcessOutcome,
+    PreviewConfig,
+    validate_preview_config,
+)
 from open_duck_tools.profile import profile_to_json
 from tests.test_motion_import import (
     action_payload,
@@ -53,6 +59,211 @@ class AddonRegistrationTests(unittest.TestCase):
             bpy.types.Object.bl_rna.properties["duck_mouth_open"].name,
             "Mouth (visual approximation)",
         )
+
+
+class FakePreviewProcess:
+    def __init__(self, outcome=None):
+        self.outcome = outcome
+        self.cancel_requests = 0
+        self.closed = []
+
+    def poll(self):
+        value, self.outcome = self.outcome, None
+        return value
+
+    def request_cancel(self):
+        self.cancel_requests += 1
+
+    def close(self, force=False):
+        self.closed.append(force)
+
+
+class PolicyPreviewOperatorTests(unittest.TestCase):
+    def setUp(self):
+        bpy.ops.wm.read_factory_settings(use_empty=True)
+        addon.register()
+        self.profile = test_profile()
+        self.armature = build_minimal_rig(self.profile)
+        self.armature.data["duck_robot_profile_json"] = profile_to_json(self.profile)
+        bpy.context.view_layer.objects.active = self.armature
+        self.armature.select_set(True)
+        self.temporary = tempfile.TemporaryDirectory()
+        root = Path(self.temporary.name)
+        runtime = root / "microduck"
+        rollout = root / "microduck_rl"
+        policy = runtime / "policies/alpha_walking.onnx"
+        exporter = rollout / "scripts/export_policy_rollout.py"
+        policy.parent.mkdir(parents=True)
+        exporter.parent.mkdir(parents=True)
+        policy.write_bytes(b"policy")
+        exporter.write_text("raise SystemExit(0)\n")
+        self.validated = validate_preview_config(
+            PreviewConfig(
+                runtime, rollout, policy, (0.3, 0.0, 0.0), 0.06, 0, root / "cache"
+            ),
+            which=lambda _name: "/usr/bin/uv",
+        )
+
+    def tearDown(self):
+        addon.unregister()
+        self.temporary.cleanup()
+
+    def write_archive(self, path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = action_payload(self.profile)
+        payload["source_hashes_json"] = np.asarray(
+            [
+                json.dumps(
+                    {
+                        "policy_sha256": self.validated.policy_sha256,
+                        "rollout_config_sha256": self.validated.rollout_config_sha256,
+                    },
+                    sort_keys=True,
+                )
+            ]
+        )
+        np.savez_compressed(path, **payload)
+
+    def install_session(self, process, output):
+        addon._POLICY_PREVIEW_SESSION = addon._PolicyPreviewSession(
+            self.armature.name,
+            self.armature.as_pointer(),
+            bpy.context.scene.name,
+            self.validated,
+            output,
+            process,
+        )
+
+    def test_success_creates_new_action_without_replacing_existing_actions(self):
+        existing = bpy.data.actions.new("Existing")
+        self.armature.animation_data_create().action = existing
+        output = self.validated.cache_path.with_name("finished.npz")
+        self.write_archive(output)
+        process = FakePreviewProcess(ProcessOutcome(0, False, "Frames: 3"))
+        self.install_session(process, output)
+
+        self.assertIsNone(addon._poll_policy_preview_job())
+
+        self.assertIsNotNone(bpy.data.actions.get("Existing"))
+        active = self.armature.animation_data.action
+        self.assertEqual(active.name, "PolicyWalk_x0.30_y0.00_yaw0.00")
+        self.assertEqual(active["duck_motion_kind"], "policy_preview")
+        self.assertEqual(active["duck_policy_preview_cache_key"], self.validated.cache_key)
+        self.assertTrue(self.validated.cache_path.is_file())
+        self.assertEqual(process.closed, [False])
+        self.assertIsNone(addon._POLICY_PREVIEW_SESSION)
+
+    def test_exact_cache_hit_imports_without_starting_process(self):
+        self.write_archive(self.validated.cache_path)
+        with mock.patch.object(
+            addon, "validate_preview_config", return_value=self.validated
+        ), mock.patch.object(addon.PreviewProcess, "start") as start:
+            result = bpy.ops.duck.generate_policy_preview()
+
+        self.assertEqual(result, {"FINISHED"})
+        start.assert_not_called()
+        self.assertEqual(
+            self.armature.animation_data.action.name,
+            "PolicyWalk_x0.30_y0.00_yaw0.00",
+        )
+        self.assertEqual(
+            self.armature.duck_policy_status,
+            "Imported PolicyWalk_x0.30_y0.00_yaw0.00 (3 frames)",
+        )
+
+    def test_invalid_cache_is_removed_and_regenerated(self):
+        self.validated.cache_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(self.validated.cache_path, bad=np.array([1]))
+        existing = bpy.data.actions.new("Existing")
+        self.armature.animation_data_create().action = existing
+        process = FakePreviewProcess()
+        with mock.patch.object(
+            addon, "validate_preview_config", return_value=self.validated
+        ), mock.patch.object(
+            addon.PreviewProcess, "start", return_value=process
+        ) as start, mock.patch.object(addon, "_ensure_policy_preview_timer"):
+            result = bpy.ops.duck.generate_policy_preview()
+
+        self.assertEqual(result, {"FINISHED"})
+        start.assert_called_once()
+        self.assertFalse(self.validated.cache_path.exists())
+        self.assertIs(self.armature.animation_data.action, existing)
+        self.assertIsNotNone(addon._POLICY_PREVIEW_SESSION)
+
+    def test_valid_archive_with_wrong_provenance_is_not_imported(self):
+        self.write_archive(self.validated.cache_path)
+        with np.load(self.validated.cache_path, allow_pickle=False) as archive:
+            payload = {key: archive[key] for key in archive.files}
+        payload["source_hashes_json"] = np.asarray(
+            [json.dumps({"policy_sha256": "0" * 64, "rollout_config_sha256": "1" * 64})]
+        )
+        np.savez_compressed(self.validated.cache_path, **payload)
+        process = FakePreviewProcess()
+        with mock.patch.object(
+            addon, "validate_preview_config", return_value=self.validated
+        ), mock.patch.object(
+            addon.PreviewProcess, "start", return_value=process
+        ), mock.patch.object(addon, "_ensure_policy_preview_timer"):
+            result = bpy.ops.duck.generate_policy_preview()
+
+        self.assertEqual(result, {"FINISHED"})
+        self.assertFalse(self.validated.cache_path.exists())
+        self.assertTrue(
+            self.armature.animation_data is None
+            or self.armature.animation_data.action is None
+        )
+        self.assertIsNotNone(addon._POLICY_PREVIEW_SESSION)
+
+    def test_failed_child_preserves_live_scene_state(self):
+        scene = bpy.context.scene
+        existing = bpy.data.actions.new("Existing")
+        self.armature.animation_data_create().action = existing
+        self.armature.location = (9.0, 8.0, 7.0)
+        self.armature.duck_mouth_open = 0.7
+        scene.frame_start, scene.frame_end = 7, 9
+        scene.frame_set(8)
+        original_matrix = self.armature.matrix_world.copy()
+        original_actions = {action.name for action in bpy.data.actions}
+        output = self.validated.cache_path.with_name("failed.npz")
+        process = FakePreviewProcess(
+            ProcessOutcome(2, False, "Policy rollout failed: incompatible input")
+        )
+        self.install_session(process, output)
+
+        self.assertIsNone(addon._poll_policy_preview_job())
+
+        self.assertIs(self.armature.animation_data.action, existing)
+        self.assertEqual({action.name for action in bpy.data.actions}, original_actions)
+        self.assertEqual((scene.frame_start, scene.frame_end, scene.frame_current), (7, 9, 8))
+        self.assertEqual(self.armature.matrix_world, original_matrix)
+        self.assertAlmostEqual(self.armature.duck_mouth_open, 0.7)
+        self.assertEqual(self.armature.duck_policy_status, "Policy preview failed")
+        self.assertIn("incompatible input", self.armature.duck_policy_details)
+
+    def test_cancel_requests_termination_and_poll_finishes_cleanup(self):
+        process = FakePreviewProcess()
+        output = self.validated.cache_path.with_name("cancelled.npz")
+        self.install_session(process, output)
+
+        self.assertEqual(bpy.ops.duck.cancel_policy_preview(), {"FINISHED"})
+        self.assertEqual(process.cancel_requests, 1)
+        self.assertEqual(self.armature.duck_policy_status, "Cancelling")
+        process.outcome = ProcessOutcome(-15, True, "")
+        self.assertIsNone(addon._poll_policy_preview_job())
+        self.assertIsNone(addon._POLICY_PREVIEW_SESSION)
+        self.assertEqual(self.armature.duck_policy_status, "Cancelled")
+
+    def test_unregister_force_closes_child_and_removes_timer(self):
+        process = FakePreviewProcess()
+        output = self.validated.cache_path.with_name("live.npz")
+        self.install_session(process, output)
+        bpy.app.timers.register(addon._poll_policy_preview_job, first_interval=60.0)
+
+        addon.unregister()
+
+        self.assertEqual(process.closed, [True])
+        self.assertFalse(bpy.app.timers.is_registered(addon._poll_policy_preview_job))
+        self.assertIsNone(addon._POLICY_PREVIEW_SESSION)
 
 class MotionImportOperatorTests(unittest.TestCase):
     def setUp(self):
