@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+from io import BytesIO
 import json
 from pathlib import Path
 import zipfile
@@ -34,10 +36,20 @@ _QUATERNION_NORM_TOLERANCE = 1e-6
 @dataclass(frozen=True)
 class ImportedMotion:
     joint_pos: np.ndarray
-    root_pos_w: np.ndarray
-    root_quat_wxyz: np.ndarray
+    body_pos_w: np.ndarray
+    body_quat_w: np.ndarray
+    root_body_index: int
+    source_sha256: str
     fps: int
     frames: int
+
+    @property
+    def root_pos_w(self) -> np.ndarray:
+        return self.body_pos_w[:, self.root_body_index]
+
+    @property
+    def root_quat_wxyz(self) -> np.ndarray:
+        return self.body_quat_w[:, self.root_body_index]
 
 
 def _array(value, field: str, shape: tuple[int, ...]) -> np.ndarray:
@@ -108,7 +120,9 @@ def _validate_source_hashes(value) -> None:
 def load_motion(path: str | Path, profile: RobotProfile) -> ImportedMotion:
     """Load a complete native archive without altering the Blender scene."""
     try:
-        with np.load(Path(path), allow_pickle=False) as archive:
+        raw = Path(path).read_bytes()
+        source_sha256 = hashlib.sha256(raw).hexdigest()
+        with np.load(BytesIO(raw), allow_pickle=False) as archive:
             keys = set(archive.files)
             if keys != _NATIVE_KEYS:
                 missing = sorted(_NATIVE_KEYS - keys)
@@ -165,23 +179,91 @@ def load_motion(path: str | Path, profile: RobotProfile) -> ImportedMotion:
         raise MotionError(
             f"body_quat_w at frame {frame}, index {body} must have a unit quaternion"
         )
-    root_quaternions = quaternions[:, 0] / norms[:, 0, None]
+    quaternions = quaternions / norms[..., None]
     for frame in range(1, frames):
-        if float(np.dot(root_quaternions[frame - 1], root_quaternions[frame])) < 0:
-            root_quaternions[frame] *= -1
+        flip = np.sum(quaternions[frame - 1] * quaternions[frame], axis=1) < 0
+        quaternions[frame, flip] *= -1
+
+    roots = tuple(body for body in profile.bodies if body.parent is None)
+    if len(roots) != 1:
+        raise MotionError(f"profile must contain exactly one root body, got {len(roots)}")
+    root_name = roots[0].name
+    try:
+        root_body_index = profile.body_names.index(root_name)
+    except ValueError as exc:
+        raise MotionError(f"profile root body {root_name!r} is missing from body_names") from exc
+
+    from mathutils import Matrix, Quaternion
+
+    from .blender_bridge import (
+        MATRIX_RESIDUAL_TOLERANCE,
+        canonical_body_matrices,
+        matrix_residual,
+    )
+
+    for frame in range(frames):
+        root_world = (
+            Matrix.Translation(positions[frame, root_body_index])
+            @ Quaternion(quaternions[frame, root_body_index]).to_matrix().to_4x4()
+        )
+        canonical = canonical_body_matrices(root_world, joints[frame], profile)
+        for body_index, body_name in enumerate(profile.body_names):
+            archived = (
+                Matrix.Translation(positions[frame, body_index])
+                @ Quaternion(quaternions[frame, body_index]).to_matrix().to_4x4()
+            )
+            position_m, rotation_rad, affine = matrix_residual(
+                archived, canonical[body_name]
+            )
+            if (
+                position_m > MATRIX_RESIDUAL_TOLERANCE
+                or rotation_rad > MATRIX_RESIDUAL_TOLERANCE
+                or affine > MATRIX_RESIDUAL_TOLERANCE
+            ):
+                raise MotionError(
+                    f"body transform differs from canonical FK at frame {frame}, "
+                    f"body {body_name!r}: position residual {position_m:.6g} m, "
+                    f"rotation residual {rotation_rad:.6g} rad"
+                )
     return ImportedMotion(
         joint_pos=joints,
-        root_pos_w=positions[:, 0].copy(),
-        root_quat_wxyz=root_quaternions,
+        body_pos_w=positions,
+        body_quat_w=quaternions,
+        root_body_index=root_body_index,
+        source_sha256=source_sha256,
         fps=50,
         frames=frames,
     )
 
 
-def import_motion_action(armature, profile: RobotProfile, path: str | Path, *, action_name: str):
+def _action_fcurves(action):
+    legacy = getattr(action, "fcurves", None)
+    if legacy is not None:
+        return tuple(legacy)
+    return tuple(
+        fcurve
+        for layer in action.layers
+        for strip in layer.strips
+        if strip.type == "KEYFRAME"
+        for channelbag in strip.channelbags
+        for fcurve in channelbag.fcurves
+    )
+
+
+def import_motion_action(
+    armature,
+    profile: RobotProfile,
+    path: str | Path,
+    *,
+    action_name: str,
+    motion_kind: str = "mjlab_import",
+    before_mutation=None,
+):
     """Import a validated motion as a root-moving action transactionally."""
     from mathutils import Matrix, Quaternion
     import bpy
+
+    from .blender_bridge import force_fk, reset_canonical_pose
 
     motion = load_motion(path, profile)
     joint_bones = []
@@ -218,21 +300,42 @@ def import_motion_action(armature, profile: RobotProfile, path: str | Path, *, a
         scene.frame_start,
         scene.frame_end,
         scene.frame_current,
+        scene.frame_subframe,
         scene.render.fps,
         scene.render.fps_base,
     )
+    constraint_influences = tuple(
+        (constraint, float(constraint.influence))
+        for pose_bone in armature.pose.bones
+        for constraint in pose_bone.constraints
+        if constraint.name.startswith("DUCK_IK")
+    )
+    had_fk_ik = "fk_ik" in armature.keys()
+    previous_fk_ik = armature.get("fk_ik")
     action = None
     try:
+        if before_mutation is not None:
+            before_mutation()
         if animation_data is None:
             animation_data = armature.animation_data_create()
         action = bpy.data.actions.new(action_name)
         action.use_fake_user = True
+        action.use_frame_range = True
+        action.frame_start = 1.0
+        action.frame_end = float(motion.frames)
+        action["duck_motion_kind"] = motion_kind
+        action["duck_source_sha256"] = motion.source_sha256
+        action["duck_loopable"] = False
+        force_fk(armature)
+        reset_canonical_pose(armature, profile)
         animation_data.action = action
         armature.rotation_mode = "QUATERNION"
         scene.render.fps = motion.fps
         scene.render.fps_base = 1.0
         scene.frame_start = 1
         scene.frame_end = motion.frames
+        joint_by_child = {joint.child_body: joint for joint in profile.joints}
+        previous_root_quaternion = None
         for index in range(motion.frames):
             frame = index + 1
             scene.frame_set(frame)
@@ -241,16 +344,42 @@ def import_motion_action(armature, profile: RobotProfile, path: str | Path, *, a
                 @ Quaternion(motion.root_quat_wxyz[index]).to_matrix().to_4x4()
             )
             armature.matrix_world = desired_root_world @ root_mjcf_rest.inverted_safe()
+            root_quaternion = armature.rotation_quaternion.copy()
+            root_quaternion.normalize()
+            if (
+                previous_root_quaternion is not None
+                and previous_root_quaternion.dot(root_quaternion) < 0.0
+            ):
+                root_quaternion.negate()
+            armature.rotation_quaternion = root_quaternion
+            previous_root_quaternion = root_quaternion.copy()
             armature.keyframe_insert(data_path="location", frame=frame, group="root")
             armature.keyframe_insert(
                 data_path="rotation_quaternion", frame=frame, group="root"
             )
-            for joint, bone, angle in zip(profile.joints, joint_bones, motion.joint_pos[index]):
-                bone.rotation_mode = "XYZ"
+            reset_canonical_pose(armature, profile)
+            for joint, bone, angle in zip(
+                profile.joints, joint_bones, motion.joint_pos[index]
+            ):
                 bone.rotation_euler.z = float(angle)
+            for body_name in profile.body_names:
+                bone = armature.pose.bones[body_name]
+                group = joint_by_child.get(body_name)
+                group_name = group.name if group is not None else body_name
+                bone.keyframe_insert(data_path="location", frame=frame, group=group_name)
+                bone.keyframe_insert(data_path="scale", frame=frame, group=group_name)
                 bone.keyframe_insert(
-                    data_path="rotation_euler", index=2, frame=frame, group=joint.name
+                    data_path=(
+                        "rotation_euler"
+                        if body_name in joint_by_child
+                        else "rotation_quaternion"
+                    ),
+                    frame=frame,
+                    group=group_name,
                 )
+        for fcurve in _action_fcurves(action):
+            for keyframe in fcurve.keyframe_points:
+                keyframe.interpolation = "LINEAR"
         scene.frame_set(scene.frame_start)
         return action
     except Exception as exc:
@@ -262,10 +391,11 @@ def import_motion_action(armature, profile: RobotProfile, path: str | Path, *, a
             scene.frame_start,
             scene.frame_end,
             current_frame,
+            current_subframe,
             scene.render.fps,
             scene.render.fps_base,
         ) = previous_scene
-        scene.frame_set(current_frame)
+        scene.frame_set(current_frame, subframe=current_subframe)
         armature.rotation_mode = previous_rotation_mode
         armature.matrix_world = previous_matrix
         if has_mouth_state:
@@ -274,6 +404,12 @@ def import_motion_action(armature, profile: RobotProfile, path: str | Path, *, a
             rotation_mode, matrix_basis = previous_pose[bone.name]
             bone.rotation_mode = rotation_mode
             bone.matrix_basis = matrix_basis
+        for constraint, influence in constraint_influences:
+            constraint.influence = influence
+        if had_fk_ik:
+            armature["fk_ik"] = previous_fk_ik
+        elif "fk_ik" in armature.keys():
+            del armature["fk_ik"]
         if action is not None and action.name in bpy.data.actions:
             bpy.data.actions.remove(action)
         if isinstance(exc, MotionError):

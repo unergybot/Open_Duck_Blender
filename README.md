@@ -171,8 +171,11 @@ Append `--mouth-linkage /path/to/authorized-mouth-linkage.json` when the
 authoritative package is available.
 
 This writes `microduck-alpha.blend`. Open it with automatic Python execution
-allowed, animate the selected armature, then use **Open Duck → Export mjlab
-Motion**. Validate the result from the `microduck_rl` checkout:
+allowed. The file opens at Walk frame 1 with the armature selected in Object
+Mode. Press `N` over the 3D View and choose the **Open Duck** tab; the panel
+shows the current FK/IK mode, animation controls, colourway, and the explicitly
+visual-only mouth approximation. Use **Open Duck → Export mjlab Motion** to
+export an action. Validate the result from the `microduck_rl` checkout:
 
 ```bash
 cd ~/MyCode/microduck_rl
@@ -211,10 +214,12 @@ active imported action again.
 
 Select the Microduck armature, press `N` while the mouse is over the 3D View,
 then open **Open Duck → Animation**. Choose any embedded action from the
-searchable **Action** field, or use **Walk** and **Crouch** for the included
-milestones. **Play/Pause** loops over that action's complete frame range, and
-**Reset** returns to its first frame. This is the simplest way to preview the
-robot; opening the Dope Sheet or Action Editor is optional.
+searchable **Action** field, or use **Walk** for the included policy milestone.
+The retained `KinematicCrouchTest` remains available through Action search but
+is not a beginner preset because it is not contact-valid; the panel displays a
+warning when it is selected. **Play Once** stops at the action's final frame,
+and **Reset** returns to its first frame. This is the simplest way to preview
+the robot; opening the Dope Sheet or Action Editor is optional.
 
 ### Policy walking milestone
 
@@ -223,14 +228,17 @@ deterministic 200-frame, 50 Hz action generated from `alpha_walking.onnx` with
 the forward command set to `0.30 m/s`. The action preserves simulated root
 motion and advances approximately `0.487 m` over four seconds. The rollout uses
 four 5 ms MuJoCo substeps per frame and records a canonical configuration digest
-alongside the policy and scene hashes.
+alongside the policy and scene hashes. The shipped archive includes the policy
+warm-up correction and independently replays with at least one foot-floor
+contact on all 200 frames. The presentation ground is visual only; motion data
+is never snapped or offset in Blender to create contact.
 
 | Frame 1 | Frame 100 | Frame 200 |
 | --- | --- | --- |
 | ![Microduck policy walk at frame 1](assets/previews/microduck-policy-walk-start.png) | ![Microduck policy walk at frame 100](assets/previews/microduck-policy-walk-mid.png) | ![Microduck policy walk at frame 200](assets/previews/microduck-policy-walk-end.png) |
 
-`microduck-alpha.blend` includes a 51-frame neutral-to-crouch-to-neutral test
-action. Its verified export is stored at
+`microduck-alpha.blend` includes the 51-frame `KinematicCrouchTest`
+neutral-to-crouch-to-neutral action. Its verified export is stored at
 `assets/motions/microduck-crouch-test.npz`; the animated mouth is visual-only
 and remains outside the 14-joint policy archive.
 

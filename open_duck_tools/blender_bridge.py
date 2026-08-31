@@ -8,6 +8,63 @@ from mathutils import Matrix, Quaternion, Vector
 import numpy as np
 
 
+MATRIX_RESIDUAL_TOLERANCE = 1e-5
+
+
+def matrix_residual(actual: Matrix, expected: Matrix) -> tuple[float, float, float]:
+    """Return translation, sign-invariant rotation, and affine residuals."""
+    actual_values = np.asarray(actual, dtype=np.float64)
+    expected_values = np.asarray(expected, dtype=np.float64)
+    if not np.isfinite(actual_values).all() or not np.isfinite(expected_values).all():
+        return math.inf, math.inf, math.inf
+    position_m = float((actual.to_translation() - expected.to_translation()).length)
+    actual_rotation = actual.to_quaternion().normalized()
+    expected_rotation = expected.to_quaternion().normalized()
+    relative = expected_rotation.conjugated() @ actual_rotation
+    relative.normalize()
+    vector_length = math.sqrt(
+        relative.x * relative.x
+        + relative.y * relative.y
+        + relative.z * relative.z
+    )
+    rotation_rad = 2.0 * math.atan2(vector_length, abs(relative.w))
+
+    def deformation(matrix: Matrix, rotation: Quaternion) -> float:
+        basis = np.asarray(matrix.to_3x3(), dtype=np.float64)
+        rigid = np.asarray(rotation.to_matrix(), dtype=np.float64)
+        return float(np.max(np.abs(basis - rigid)))
+
+    affine = max(
+        deformation(actual, actual_rotation),
+        deformation(expected, expected_rotation),
+    )
+    residuals = (position_m, rotation_rad, affine)
+    if not all(math.isfinite(value) for value in residuals):
+        return math.inf, math.inf, math.inf
+    return residuals
+
+
+def force_fk(armature) -> None:
+    """Disable Duck IK directly without baking the evaluated IK pose."""
+    for pose_bone in armature.pose.bones:
+        for constraint in pose_bone.constraints:
+            if constraint.name.startswith("DUCK_IK"):
+                constraint.influence = 0.0
+    armature["fk_ik"] = 0.0
+
+
+def reset_canonical_pose(armature, profile) -> None:
+    """Clear every non-authoritative pose offset on canonical body bones."""
+    joint_children = {joint.child_body for joint in profile.joints}
+    missing = [name for name in profile.body_names if armature.pose.bones.get(name) is None]
+    if missing:
+        raise ValueError(f"armature is missing canonical body bones: {', '.join(missing)}")
+    for body_name in profile.body_names:
+        bone = armature.pose.bones[body_name]
+        bone.matrix_basis = Matrix.Identity(4)
+        bone.rotation_mode = "XYZ" if body_name in joint_children else "QUATERNION"
+
+
 def _rest_matrix(body) -> Matrix:
     return Matrix.Translation(body.position) @ Quaternion(body.quaternion_wxyz).to_matrix().to_4x4()
 

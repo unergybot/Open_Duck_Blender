@@ -1,4 +1,5 @@
 from contextlib import redirect_stderr
+import hashlib
 import importlib.util
 import io
 import json
@@ -10,13 +11,13 @@ from unittest import mock
 from pathlib import Path
 
 import bpy
+import numpy as np
 
-from open_duck_tools.motion import MotionError
+from open_duck_tools.motion import MotionError, build_motion_archive
 from open_duck_tools.profile import ProfileError
 
 
 SCRIPT = Path(__file__).parents[1] / "tools" / "build_microduck_blend.py"
-POLICY_SHA256 = "822a1fbde45f31c7b703d09a225115f430672fd0ba4873d97201b35832348b54"
 JOINT_NAMES = (
     "left_hip_yaw",
     "left_hip_roll",
@@ -85,6 +86,15 @@ def write_controlled_build_sources(root: Path) -> None:
     contract.parent.mkdir(parents=True)
     bodies = []
     for joint, body in zip(JOINT_NAMES, BODY_NAMES[1:]):
+        foot_site = (
+            '<site name="left_foot" pos="0 -0.0238146 -0.0140852" '
+            'quat="0 0 0.707107 0.707107"/>'
+            if body == "ankle_left"
+            else '<site name="right_foot" pos="0 -0.0238146 -0.0140852" '
+            'quat="0.707107 -0.707107 0 0"/>'
+            if body == "ankle_right"
+            else ""
+        )
         visuals = (
             '<geom type="mesh" class="visual" mesh="jaw"/>'
             '<geom type="mesh" class="visual" mesh="jaw_soft"/>'
@@ -93,7 +103,7 @@ def write_controlled_build_sources(root: Path) -> None:
         )
         bodies.append(
             f'<body name="{body}"><joint name="{joint}" axis="0 0 1" '
-            f'range="-10 10"/>{visuals}</body>'
+            f'range="-10 10"/>{foot_site}{visuals}</body>'
         )
     (robot / "robot_walk.xml").write_text(
         '<mujoco model="microduck"><compiler meshdir="assets"/>'
@@ -115,6 +125,28 @@ def write_controlled_build_sources(root: Path) -> None:
         + ", ".join(f'"{name}"' for name in (*JOINT_NAMES, "mouth"))
         + "];"
     )
+
+
+def write_controlled_motion(path: Path, frame_count: int, travel: float) -> str:
+    root_x = np.linspace(0.0, travel, frame_count)
+    body_pos = np.zeros((frame_count, len(BODY_NAMES), 3), dtype=np.float64)
+    body_pos[:, :, 0] = root_x[:, None]
+    body_pos[:, :, 2] = 0.12
+    archive = build_motion_archive(
+        np.zeros((frame_count, len(JOINT_NAMES)), dtype=np.float64),
+        body_pos,
+        np.tile(
+            np.array([1.0, 0.0, 0.0, 0.0]),
+            (frame_count, len(BODY_NAMES), 1),
+        ),
+        fps=50,
+        joint_names=JOINT_NAMES,
+        body_names=BODY_NAMES,
+        joint_ranges=tuple((-10.0, 10.0) for _name in JOINT_NAMES),
+        source_hashes={"fixture": "controlled"},
+    )
+    np.savez_compressed(path, **archive)
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 class BuildCliTests(unittest.TestCase):
@@ -142,38 +174,55 @@ class BuildCliTests(unittest.TestCase):
             root = Path(directory)
             output = root / "microduck-alpha.blend"
             write_controlled_build_sources(root)
+            demo_motion = root / "controlled-crouch.npz"
+            policy_motion = root / "controlled-policy.npz"
+            demo_sha256 = write_controlled_motion(demo_motion, 51, 0.0)
+            policy_sha256 = write_controlled_motion(policy_motion, 200, 0.5)
             args = MODULE._arguments(
                 [
                     "--runtime-root",
                     str(root / "runtime"),
                     "--rl-root",
                     str(root / "rl"),
+                    "--demo-motion",
+                    str(demo_motion),
+                    "--policy-motion",
+                    str(policy_motion),
                     "--output",
                     str(output),
                 ]
             )
             try:
                 MODULE.build(args)
-            except ProfileError as exc:
+            except (ProfileError, MotionError) as exc:
                 self.fail(f"controlled build roots were not portable: {exc}")
             bpy.ops.wm.open_mainfile(filepath=str(output))
 
             self.assertEqual(
                 {action.name for action in bpy.data.actions},
-                {"MicroduckCrouchTest", "Policy_alpha_walking_forward"},
+                {"KinematicCrouchTest", "Policy_alpha_walking_forward"},
             )
-            self.assertTrue(bpy.data.actions["MicroduckCrouchTest"].use_fake_user)
+            crouch = bpy.data.actions["KinematicCrouchTest"]
+            policy = bpy.data.actions["Policy_alpha_walking_forward"]
+            self.assertTrue(crouch.use_fake_user)
             self.assertTrue(
-                bpy.data.actions["Policy_alpha_walking_forward"].use_fake_user
+                policy.use_fake_user
             )
             self.assertEqual(
-                tuple(bpy.data.actions["MicroduckCrouchTest"].frame_range),
+                tuple(crouch.frame_range),
                 (1.0, 51.0),
             )
             self.assertEqual(
-                tuple(bpy.data.actions["Policy_alpha_walking_forward"].frame_range),
+                tuple(policy.frame_range),
                 (1.0, 200.0),
             )
+            self.assertEqual(crouch["duck_motion_kind"], "kinematic_test")
+            self.assertEqual(crouch["duck_source_sha256"], demo_sha256)
+            self.assertFalse(crouch["duck_loopable"])
+            self.assertFalse(crouch["duck_contact_valid"])
+            self.assertEqual(policy["duck_motion_kind"], "policy_rollout")
+            self.assertEqual(policy["duck_source_sha256"], policy_sha256)
+            self.assertFalse(policy["duck_loopable"])
             self.assertEqual(bpy.context.scene.render.fps, 50)
             self.assertEqual(bpy.context.scene.render.fps_base, 1.0)
             self.assertEqual(
@@ -189,10 +238,50 @@ class BuildCliTests(unittest.TestCase):
                 bpy.data.objects["MicroduckRig"].duck_action_name,
                 "Policy_alpha_walking_forward",
             )
+            scene_children = {collection.name for collection in bpy.context.scene.collection.children}
+            self.assertEqual(scene_children, {"Microduck", "Presentation"})
+            microduck = bpy.data.collections["Microduck"]
+            self.assertEqual(
+                {collection.name for collection in microduck.children},
+                {"Rig", "Visuals", "Controls"},
+            )
+            self.assertEqual(
+                {obj.name for obj in bpy.data.collections["Rig"].objects},
+                {"MicroduckRig"},
+            )
+            self.assertEqual(
+                {obj.name for obj in bpy.data.collections["Visuals"].objects},
+                {"visual::jaw", "visual::jaw_soft"},
+            )
+            self.assertEqual(
+                {obj.name for obj in bpy.data.collections["Presentation"].objects},
+                {"Ground", "MicroduckCamera", "KeyLight", "FillLight"},
+            )
+            ground = bpy.data.objects["Ground"]
+            self.assertAlmostEqual(ground.matrix_world.translation.z, 0.0, places=7)
+            self.assertGreaterEqual(ground.dimensions.x, 0.65 - 1e-6)
+            self.assertGreaterEqual(ground.dimensions.y, 0.30 - 1e-6)
+            self.assertIs(bpy.context.scene.camera, bpy.data.objects["MicroduckCamera"])
+            armature = bpy.data.objects["MicroduckRig"]
+            self.assertEqual(armature.data.display_type, "STICK")
+            self.assertTrue(armature.show_in_front)
+            self.assertEqual(armature.mode, "OBJECT")
+            self.assertIs(bpy.context.view_layer.objects.active, armature)
+            self.assertEqual(armature["fk_ik"], 0.0)
             manifest = json.loads(
                 bpy.data.texts["microduck-build-manifest.json"].as_string()
             )
-            self.assertEqual(manifest["policy_motion_sha256"], POLICY_SHA256)
+            self.assertEqual(manifest["schema_version"], 2)
+            self.assertEqual(
+                manifest["motion_sha256"],
+                {
+                    "KinematicCrouchTest": demo_sha256,
+                    "Policy_alpha_walking_forward": policy_sha256,
+                },
+            )
+            self.assertEqual(manifest["source_sha256"], armature.data["duck_robot_profile_json"] and json.loads(armature.data["duck_robot_profile_json"])["source_sha256"])
+            self.assertEqual(manifest["build_blender_version"], bpy.app.version_string)
+            self.assertEqual(manifest["mouth_mode"], "image-derived-approximation")
 
     def test_reports_all_missing_canonical_sources_before_build(self):
         with tempfile.TemporaryDirectory() as directory:

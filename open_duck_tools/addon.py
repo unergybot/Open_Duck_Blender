@@ -12,10 +12,15 @@ from mathutils import Matrix, Quaternion
 import numpy as np
 
 from .blender_bridge import (
+    MATRIX_RESIDUAL_TOLERANCE,
     body_samples,
     canonical_body_matrices,
+    force_fk,
     joint_angles_from_body_matrices,
+    matrix_residual,
+    reset_canonical_pose,
 )
+from .ik import leg_kinematics, solve_leg_ik
 from .motion import MotionError, build_motion_archive, save_motion_npz
 from .motion_import import import_motion_action
 from .profile import ProfileError, profile_from_json
@@ -27,6 +32,8 @@ COLORWAYS = {
     "LAVENDER": ("Lavender", "#bfa9cf", "#f7c948"),
     "SKY": ("Sky", "#a9dbe8", "#f59e0b"),
 }
+BEGINNER_ACTION_PRESETS = (("Policy_alpha_walking_forward", "Walk"),)
+_IK_UPDATE_GUARD: set[int] = set()
 
 
 def _srgb_channel(value: int) -> float:
@@ -74,13 +81,28 @@ def collect_armature_motion(
     if frame_end < frame_start:
         raise MotionError("export frame end precedes frame start")
     scene = bpy.context.scene
+    fps_base = float(scene.render.fps_base)
+    effective_fps = (
+        float(scene.render.fps) / fps_base
+        if math.isfinite(fps_base) and fps_base > 0.0
+        else math.inf
+    )
+    if not math.isclose(effective_fps, 50.0, rel_tol=0.0, abs_tol=1e-9):
+        raise MotionError(
+            f"effective frame rate is {effective_fps:.12g} Hz; "
+            "Microduck motion export requires 50 Hz"
+        )
     original_frame = scene.frame_current
+    original_subframe = scene.frame_subframe
     joint_frames = []
     body_positions = []
     body_quaternions = []
     rest_matrices = _rest_body_matrices(armature, profile.body_names)
-    root_name = next(body.name for body in profile.bodies if body.parent is None)
-    root_spec = next(body for body in profile.bodies if body.name == root_name)
+    roots = tuple(body for body in profile.bodies if body.parent is None)
+    if len(roots) != 1:
+        raise MotionError(f"profile must contain exactly one root body, got {len(roots)}")
+    root_spec = roots[0]
+    root_name = root_spec.name
     root_mjcf_rest = Matrix.Translation(root_spec.position) @ Quaternion(
         root_spec.quaternion_wxyz
     ).to_matrix().to_4x4()
@@ -96,16 +118,32 @@ def collect_armature_motion(
                 @ root_mjcf_rest
             )
             canonical = canonical_body_matrices(root_world, angles, profile)
+            for body_name in profile.body_names:
+                position_m, rotation_rad, affine = matrix_residual(
+                    matrices[body_name], canonical[body_name]
+                )
+                if (
+                    position_m > MATRIX_RESIDUAL_TOLERANCE
+                    or rotation_rad > MATRIX_RESIDUAL_TOLERANCE
+                    or affine > MATRIX_RESIDUAL_TOLERANCE
+                ):
+                    raise MotionError(
+                        "evaluated body transform differs from canonical FK at "
+                        f"frame {frame}, body {body_name!r}: "
+                        f"position residual {position_m:.6g} m, "
+                        f"rotation residual {rotation_rad:.6g} rad, "
+                        f"affine residual {affine:.6g}"
+                    )
             positions, quaternions = body_samples(canonical, profile)
             body_positions.append(positions)
             body_quaternions.append(quaternions)
     finally:
-        scene.frame_set(original_frame)
+        scene.frame_set(original_frame, subframe=original_subframe)
     return build_motion_archive(
         np.asarray(joint_frames),
         np.asarray(body_positions),
         np.asarray(body_quaternions),
-        fps=scene.render.fps,
+        fps=50,
         joint_names=profile.joint_names,
         body_names=profile.body_names,
         joint_ranges=tuple(joint.range_rad for joint in profile.joints),
@@ -124,7 +162,6 @@ def _apply_colorway(armature: bpy.types.Object, key: str) -> None:
                 node = material.node_tree.nodes.get("Principled BSDF")
                 if node is not None:
                     node.inputs["Base Color"].default_value = colors[role]
-    armature["duck_colorway"] = key
 
 
 def _colorway_updated(self, _context):
@@ -176,21 +213,113 @@ def _mouth_updated(self, _context):
         _apply_mouth_pose(self, self.duck_mouth_open)
 
 
-def _leg_body_chain(profile, side: str) -> list[str]:
-    by_joint = {joint.name: joint.child_body for joint in profile.joints}
-    names = [
-        f"{side}_hip_roll",
-        f"{side}_hip_pitch",
-        f"{side}_knee",
-        f"{side}_ankle",
-    ]
-    return [by_joint[name] for name in names if name in by_joint]
+def _leg_joint_specs(profile, side: str):
+    by_name = {joint.name: joint for joint in profile.joints}
+    names = tuple(
+        f"{side}_{suffix}"
+        for suffix in ("hip_roll", "hip_pitch", "knee", "ankle")
+    )
+    try:
+        return tuple(by_name[name] for name in names)
+    except KeyError as exc:
+        raise MotionError(f"profile is missing complete {side} leg chain") from exc
 
 
-def _ankle_target_matrix(armature_world: Matrix, ankle_matrix: Matrix, ankle_tail):
-    target = armature_world @ ankle_matrix
-    target.translation = armature_world @ ankle_tail
-    return target
+def _physical_site_matrix(armature, profile, side: str) -> Matrix:
+    site = next(
+        (site for site in profile.sites if site.name == f"{side}_foot"),
+        None,
+    )
+    if site is None:
+        raise MotionError(f"profile is missing physical site {side}_foot")
+    ankle = armature.pose.bones.get(site.parent_body)
+    if ankle is None:
+        raise MotionError(f"armature is missing ankle body {site.parent_body}")
+    return ankle.matrix @ Matrix.Translation(site.position) @ Quaternion(
+        site.quaternion_wxyz
+    ).to_matrix().to_4x4()
+
+
+def update_physical_ik(armature) -> None:
+    """Solve both physical foot controls onto canonical local-Z hinges."""
+    if float(armature.get("fk_ik", 0.0)) < 0.5:
+        return
+    bpy.context.view_layer.update()
+    profile = profile_from_armature(armature)
+    solutions = []
+    for side in ("left", "right"):
+        joints = _leg_joint_specs(profile, side)
+        foot = armature.pose.bones.get(f"IK_FOOT_{side}")
+        pole = armature.pose.bones.get(f"IK_POLE_{side}")
+        hip_yaw = armature.pose.bones.get(joints[0].parent_body)
+        if foot is None or pole is None or hip_yaw is None:
+            raise MotionError(f"armature is missing {side} physical IK controls")
+        model = leg_kinematics(profile, side)
+        hip_inverse = hip_yaw.matrix.inverted_safe()
+        target = hip_inverse @ foot.matrix.translation
+        pole_local = hip_inverse @ pole.matrix.translation
+        initial = np.asarray(
+            [armature.pose.bones[joint.child_body].rotation_euler.z for joint in joints],
+            dtype=np.float64,
+        )
+        result = solve_leg_ik(
+            model,
+            tuple(target),
+            float(foot.get("duck_sagittal_pitch", 0.0)),
+            initial_angles=initial,
+            pole_sign=float(pole_local.y),
+        )
+        solutions.append((joints, foot, result))
+    for joints, foot, result in solutions:
+        for joint, angle in zip(joints, result.angles, strict=True):
+            pose_bone = armature.pose.bones[joint.child_body]
+            pose_bone.rotation_mode = "XYZ"
+            pose_bone.location = (0.0, 0.0, 0.0)
+            pose_bone.scale = (1.0, 1.0, 1.0)
+            pose_bone.rotation_euler = (0.0, 0.0, float(angle))
+        foot["duck_ik_clamped"] = bool(result.clamped)
+
+
+def _clear_physical_ik_handlers() -> None:
+    for handlers in (
+        bpy.app.handlers.frame_change_post,
+        bpy.app.handlers.depsgraph_update_post,
+    ):
+        for handler in tuple(handlers):
+            if getattr(handler, "_duck_physical_ik_handler", False):
+                handlers.remove(handler)
+
+
+@bpy.app.handlers.persistent
+def _physical_ik_update_handler(_scene, *_args) -> None:
+    for armature in tuple(bpy.data.objects):
+        if (
+            armature.type != "ARMATURE"
+            or armature.get("duck_robot_id") != "microduck-alpha"
+        ):
+            continue
+        pointer = armature.as_pointer()
+        if pointer in _IK_UPDATE_GUARD:
+            continue
+        _IK_UPDATE_GUARD.add(pointer)
+        try:
+            if hasattr(armature, "duck_mouth_open"):
+                _apply_mouth_pose(armature, float(armature.duck_mouth_open))
+            if float(armature.get("fk_ik", 0.0)) >= 0.5:
+                update_physical_ik(armature)
+        except (MotionError, ProfileError, ValueError):
+            armature["duck_ik_update_error"] = True
+        finally:
+            _IK_UPDATE_GUARD.discard(pointer)
+
+
+_physical_ik_update_handler._duck_physical_ik_handler = True
+
+
+def _install_physical_ik_handlers() -> None:
+    _clear_physical_ik_handlers()
+    bpy.app.handlers.frame_change_post.append(_physical_ik_update_handler)
+    bpy.app.handlers.depsgraph_update_post.append(_physical_ik_update_handler)
 
 
 class DUCK_OT_switch_ik(bpy.types.Operator):
@@ -201,22 +330,37 @@ class DUCK_OT_switch_ik(bpy.types.Operator):
     def execute(self, context):
         armature = context.object
         profile = profile_from_armature(armature)
-        for side in ("left", "right"):
-            chain = _leg_body_chain(profile, side)
-            ankle = armature.pose.bones.get(chain[-1]) if len(chain) == 4 else None
-            target = bpy.data.objects.get(f"IK_FOOT_{side}")
-            if ankle is None or target is None:
-                self.report({"ERROR"}, f"Missing {side} IK controls")
-                return {"CANCELLED"}
-            target.matrix_world = _ankle_target_matrix(
-                armature.matrix_world, ankle.matrix, ankle.tail
-            )
-            for constraint in ankle.constraints:
-                if constraint.name.startswith("DUCK_IK"):
-                    constraint.influence = 1.0
-        armature["fk_ik"] = 1.0
-        context.view_layer.update()
-        return {"FINISHED"}
+        original_flag = float(armature.get("fk_ik", 0.0))
+        targets = {}
+        try:
+            for side in ("left", "right"):
+                joints = _leg_joint_specs(profile, side)
+                target = armature.pose.bones.get(f"IK_FOOT_{side}")
+                if target is None:
+                    raise MotionError(f"armature is missing {side} foot control")
+                targets[side] = target.matrix.copy()
+                angles = np.asarray(
+                    [
+                        armature.pose.bones[joint.child_body].rotation_euler.z
+                        for joint in joints
+                    ],
+                    dtype=np.float64,
+                )
+                target.matrix = _physical_site_matrix(armature, profile, side)
+                target["duck_sagittal_pitch"] = leg_kinematics(
+                    profile, side
+                ).forward(angles).pitch
+            armature["fk_ik"] = 1.0
+            context.view_layer.update()
+            update_physical_ik(armature)
+            context.view_layer.update()
+            return {"FINISHED"}
+        except (MotionError, ValueError) as exc:
+            armature["fk_ik"] = original_flag
+            for side, matrix in targets.items():
+                armature.pose.bones[f"IK_FOOT_{side}"].matrix = matrix
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
 
 
 class DUCK_OT_switch_fk(bpy.types.Operator):
@@ -226,30 +370,8 @@ class DUCK_OT_switch_fk(bpy.types.Operator):
 
     def execute(self, context):
         armature = context.object
-        profile = profile_from_armature(armature)
-        chains = {side: _leg_body_chain(profile, side) for side in ("left", "right")}
-        if any(len(chain) != 4 for chain in chains.values()):
-            self.report({"ERROR"}, "Profile is missing a complete leg chain")
-            return {"CANCELLED"}
-        evaluated = armature.evaluated_get(context.evaluated_depsgraph_get())
-        solved = {
-            name: evaluated.pose.bones[name].matrix.copy()
-            for chain in chains.values()
-            for name in chain
-        }
-        for side, chain in chains.items():
-            ankle = armature.pose.bones.get(chain[-1])
-            if ankle is None:
-                self.report({"ERROR"}, f"Missing {side} FK controls")
-                return {"CANCELLED"}
-            for constraint in ankle.constraints:
-                if constraint.name.startswith("DUCK_IK"):
-                    constraint.influence = 0.0
-            context.view_layer.update()
-            for name in chain:
-                armature.pose.bones[name].matrix = solved[name]
-                context.view_layer.update()
         armature["fk_ik"] = 0.0
+        context.view_layer.update()
         return {"FINISHED"}
 
 
@@ -259,13 +381,122 @@ def _default_motion_action_name(filepath: str) -> str:
     return sanitized or "ImportedMotion"
 
 
+def _clear_play_once_handlers(scene=None) -> None:
+    scene_pointer = scene.as_pointer() if scene is not None else None
+    for handler in tuple(bpy.app.handlers.frame_change_post):
+        if not getattr(handler, "_duck_play_once_handler", False):
+            continue
+        if scene_pointer is not None and getattr(
+            handler, "_duck_scene_pointer", None
+        ) != scene_pointer:
+            continue
+        bpy.app.handlers.frame_change_post.remove(handler)
+
+
+def _clear_native_playback_handlers(scene=None) -> None:
+    scene_pointer = scene.as_pointer() if scene is not None else None
+    for handler in tuple(bpy.app.handlers.animation_playback_post):
+        if not getattr(handler, "_duck_native_playback_handler", False):
+            continue
+        if scene_pointer is not None and getattr(
+            handler, "_duck_scene_pointer", None
+        ) != scene_pointer:
+            continue
+        bpy.app.handlers.animation_playback_post.remove(handler)
+        target_scene = getattr(handler, "_duck_scene", None)
+        previous_mode = getattr(handler, "_duck_previous_loop_mode", None)
+        if (
+            target_scene is not None
+            and previous_mode is not None
+            and hasattr(target_scene, "playback_loop_mode")
+        ):
+            target_scene.playback_loop_mode = previous_mode
+
+
+def _stop_playback(context) -> None:
+    screen = getattr(context, "screen", None)
+    if screen is not None and screen.is_animation_playing:
+        bpy.ops.screen.animation_cancel(restore_frame=False)
+    scene = getattr(context, "scene", None)
+    _clear_play_once_handlers(scene)
+    _clear_native_playback_handlers(scene)
+
+
+def _action_range(action) -> tuple[int, int]:
+    if action.use_frame_range:
+        start, end = action.frame_start, action.frame_end
+    else:
+        start, end = action.frame_range
+    return math.floor(start), math.ceil(end)
+
+
+def _set_action_scene_range(scene, action) -> tuple[int, int]:
+    start, end = _action_range(action)
+    scene.frame_start = start
+    scene.frame_end = end
+    scene.use_preview_range = False
+    return start, end
+
+
+def _is_loopable(action) -> bool:
+    return bool(action.get("duck_loopable", True))
+
+
+def _install_play_once_handler(scene) -> None:
+    _clear_play_once_handlers(scene)
+    scene_pointer = scene.as_pointer()
+    end_frame = scene.frame_end
+
+    def stop_at_end(changed_scene, *_args):
+        if changed_scene.as_pointer() != scene_pointer:
+            return
+        if changed_scene.frame_current < end_frame:
+            return
+        screen = bpy.context.screen
+        if screen is not None and screen.is_animation_playing:
+            bpy.ops.screen.animation_cancel(restore_frame=False)
+        _clear_play_once_handlers(changed_scene)
+
+    stop_at_end._duck_play_once_handler = True
+    stop_at_end._duck_scene_pointer = scene_pointer
+    bpy.app.handlers.frame_change_post.append(stop_at_end)
+
+
+def _install_native_playback_cleanup(scene) -> None:
+    _clear_native_playback_handlers(scene)
+    scene_pointer = scene.as_pointer()
+    previous_mode = scene.playback_loop_mode
+
+    def restore_after_playback(changed_scene, *_args):
+        if changed_scene.as_pointer() == scene_pointer:
+            _clear_native_playback_handlers(changed_scene)
+
+    restore_after_playback._duck_native_playback_handler = True
+    restore_after_playback._duck_scene_pointer = scene_pointer
+    restore_after_playback._duck_scene = scene
+    restore_after_playback._duck_previous_loop_mode = previous_mode
+    bpy.app.handlers.animation_playback_post.append(restore_after_playback)
+
+
+def _configure_action_playback(scene, action) -> None:
+    _clear_play_once_handlers(scene)
+    if hasattr(scene, "playback_loop_mode"):
+        _install_native_playback_cleanup(scene)
+        scene.playback_loop_mode = (
+            "INFINITE" if _is_loopable(action) else "STOP_END_FRAME"
+        )
+    elif not _is_loopable(action):
+        _install_play_once_handler(scene)
+
+
 def _activate_action(armature, action, scene) -> None:
+    force_fk(armature)
+    _stop_playback(bpy.context)
+    reset_canonical_pose(armature, profile_from_armature(armature))
     armature.animation_data_create()
     armature.animation_data.action = action
-    start, end = action.frame_range
-    scene.frame_start = math.floor(start)
-    scene.frame_end = math.ceil(end)
-    scene.frame_set(scene.frame_start)
+    start, _end = _set_action_scene_range(scene, action)
+    scene.frame_set(start)
 
 
 def _action_name_get(armature) -> str:
@@ -301,8 +532,8 @@ class DUCK_OT_select_action(bpy.types.Operator):
 
 class DUCK_OT_toggle_animation(bpy.types.Operator):
     bl_idname = "duck.toggle_animation"
-    bl_label = "Play/Pause"
-    bl_description = "Play or pause the active animation over its frame range"
+    bl_label = "Play Once/Pause"
+    bl_description = "Play a non-looping action once, or pause the active animation"
 
     def execute(self, context):
         armature = context.object
@@ -314,14 +545,20 @@ class DUCK_OT_toggle_animation(bpy.types.Operator):
             self.report({"WARNING"}, "Select an animation action first")
             return {"CANCELLED"}
         if context.screen.is_animation_playing:
-            bpy.ops.screen.animation_cancel(restore_frame=False)
+            _stop_playback(context)
         else:
-            if not (
-                context.scene.frame_start
-                <= context.scene.frame_current
-                <= context.scene.frame_end
-            ):
-                context.scene.frame_set(context.scene.frame_start)
+            action = armature.animation_data.action
+            force_fk(armature)
+            reset_canonical_pose(armature, profile_from_armature(armature))
+            start, end = _set_action_scene_range(context.scene, action)
+            if context.scene.frame_current < start or context.scene.frame_current >= end:
+                context.scene.frame_set(start)
+            else:
+                context.scene.frame_set(
+                    context.scene.frame_current,
+                    subframe=context.scene.frame_subframe,
+                )
+            _configure_action_playback(context.scene, action)
             bpy.ops.screen.animation_play()
         return {"FINISHED"}
 
@@ -332,9 +569,20 @@ class DUCK_OT_reset_animation(bpy.types.Operator):
     bl_description = "Pause and return to the first animation frame"
 
     def execute(self, context):
-        if context.screen.is_animation_playing:
-            bpy.ops.screen.animation_cancel(restore_frame=False)
-        context.scene.frame_set(context.scene.frame_start)
+        armature = context.object
+        action = (
+            armature.animation_data.action
+            if armature is not None and armature.animation_data is not None
+            else None
+        )
+        if action is not None:
+            force_fk(armature)
+            reset_canonical_pose(armature, profile_from_armature(armature))
+            start, _end = _set_action_scene_range(context.scene, action)
+        else:
+            start = context.scene.frame_start
+        _stop_playback(context)
+        context.scene.frame_set(start)
         return {"FINISHED"}
 
 
@@ -359,8 +607,10 @@ class DUCK_OT_import_motion(bpy.types.Operator, ImportHelper):
                 profile,
                 Path(self.filepath),
                 action_name=action_name,
+                before_mutation=lambda: _stop_playback(context),
             )
         except (MotionError, ProfileError, OSError, ValueError) as exc:
+            _stop_playback(context)
             self.report({"WARNING"}, str(exc))
             return {"CANCELLED"}
         frame_count = context.scene.frame_end - context.scene.frame_start + 1
@@ -411,7 +661,11 @@ class DUCK_PT_tools(bpy.types.Panel):
         layout.label(text=f"Robot: {armature.get('duck_robot_id')}")
         if armature.get("duck_robot_id") == "microduck-alpha":
             layout.prop(armature, "duck_colorway", text="Colourway")
-            layout.prop(armature, "duck_mouth_open", text="Mouth")
+            layout.prop(armature, "duck_mouth_open")
+        layout.label(
+            text="Mode: IK" if float(armature.get("fk_ik", 0.0)) >= 0.5 else "Mode: FK",
+            icon="CON_KINEMATIC" if float(armature.get("fk_ik", 0.0)) >= 0.5 else "BONE_DATA",
+        )
         row = layout.row(align=True)
         row.operator("duck.switch_fk")
         row.operator("duck.switch_ik")
@@ -425,19 +679,29 @@ class DUCK_PT_tools(bpy.types.Panel):
             text="Action",
         )
         presets = animation.row(align=True)
-        for action_name, label in (
-            ("Policy_alpha_walking_forward", "Walk"),
-            ("MicroduckCrouchTest", "Crouch"),
-        ):
+        for action_name, label in BEGINNER_ACTION_PRESETS:
             if bpy.data.actions.get(action_name) is not None:
                 operator = presets.operator("duck.select_action", text=label)
                 operator.action_name = action_name
         active_action = armature.animation_data and armature.animation_data.action
+        if active_action and not bool(active_action.get("duck_contact_valid", True)):
+            animation.label(
+                text="Kinematic test only — ground contact is not guaranteed",
+                icon="ERROR",
+            )
         controls = animation.row(align=True)
         controls.enabled = bool(active_action)
         controls.operator(
             "duck.toggle_animation",
-            text="Pause" if context.screen.is_animation_playing else "Play",
+            text=(
+                "Pause"
+                if context.screen.is_animation_playing
+                else (
+                    "Play"
+                    if active_action and _is_loopable(active_action)
+                    else "Play Once"
+                )
+            ),
             icon="PAUSE" if context.screen.is_animation_playing else "PLAY",
         )
         controls.operator("duck.reset_animation", text="Reset", icon="LOOP_BACK")
@@ -467,6 +731,9 @@ CLASSES = (
 
 
 def register():
+    _clear_play_once_handlers()
+    _clear_native_playback_handlers()
+    _install_physical_ik_handlers()
     for cls in CLASSES:
         if not hasattr(bpy.types, cls.__name__):
             bpy.utils.register_class(cls)
@@ -479,7 +746,7 @@ def register():
         )
     if not hasattr(bpy.types.Object, "duck_mouth_open"):
         bpy.types.Object.duck_mouth_open = bpy.props.FloatProperty(
-            name="Mouth",
+            name="Mouth (visual approximation)",
             min=0.0,
             max=1.0,
             default=0.0,
@@ -494,6 +761,11 @@ def register():
 
 
 def unregister():
+    _stop_playback(bpy.context)
+    _clear_play_once_handlers()
+    _clear_native_playback_handlers()
+    _clear_physical_ik_handlers()
+    _IK_UPDATE_GUARD.clear()
     if hasattr(bpy.types.Object, "duck_action_name"):
         del bpy.types.Object.duck_action_name
     if hasattr(bpy.types.Object, "duck_mouth_open"):

@@ -3,6 +3,7 @@ import unittest
 
 from mathutils import Matrix, Quaternion, Vector
 
+import open_duck_tools.blender_bridge as blender_bridge
 from open_duck_tools.blender_bridge import (
     body_samples,
     canonical_body_matrices,
@@ -14,7 +15,7 @@ from open_duck_tools.profile import BodySpec, JointSpec, RobotProfile
 class BlenderBridgeTests(unittest.TestCase):
     def profile(self):
         return RobotProfile(
-            schema_version=1,
+            schema_version=2,
             robot_id="fixture",
             joint_names=("hinge",),
             body_names=("root", "child"),
@@ -81,6 +82,33 @@ class BlenderBridgeTests(unittest.TestCase):
         for row in range(4):
             for column in range(4):
                 self.assertAlmostEqual(matrices["child"][row][column], expected[row][column])
+
+    def test_matrix_residual_reports_stable_position_rotation_and_affine_drift(self):
+        self.assertTrue(hasattr(blender_bridge, "matrix_residual"))
+        expected = Matrix.Identity(4)
+        actual = Matrix.Translation((2e-5, 0.0, 0.0)) @ Matrix.Rotation(
+            2e-6, 4, "X"
+        )
+        position_m, rotation_rad, affine = blender_bridge.matrix_residual(
+            actual, expected
+        )
+
+        self.assertAlmostEqual(position_m, 2e-5, places=10)
+        self.assertAlmostEqual(rotation_rad, 2e-6, delta=2e-7)
+        self.assertLess(affine, 1e-7)
+
+        scaled = Matrix.Diagonal((1.001, 1.0, 1.0, 1.0))
+        _, _, scaled_affine = blender_bridge.matrix_residual(scaled, expected)
+        self.assertGreater(scaled_affine, 9e-4)
+
+    def test_matrix_residual_fails_closed_for_non_finite_matrices(self):
+        expected = Matrix.Identity(4)
+        for value in (math.nan, math.inf, -math.inf):
+            with self.subTest(value=value):
+                actual = Matrix.Identity(4)
+                actual[0][0] = value
+                residuals = blender_bridge.matrix_residual(actual, expected)
+                self.assertEqual(residuals, (math.inf, math.inf, math.inf))
 
 
 if __name__ == "__main__":
