@@ -103,6 +103,11 @@ def _organize_release_scene(armature, policy_motion: Path) -> None:
 
     armature.data.display_type = "STICK"
     armature.show_in_front = True
+    for screen in bpy.data.screens:
+        for area in screen.areas:
+            if area.type == "VIEW_3D":
+                area.spaces.active.show_region_ui = True
+                area.spaces.active.shading.type = "MATERIAL"
     bpy.ops.object.mode_set(mode="OBJECT") if armature.mode != "OBJECT" else None
     bpy.ops.object.select_all(action="DESELECT")
     armature.select_set(True)

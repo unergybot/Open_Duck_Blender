@@ -296,7 +296,6 @@ def _physical_ik_update_handler(_scene, *_args) -> None:
         if (
             armature.type != "ARMATURE"
             or armature.get("duck_robot_id") != "microduck-alpha"
-            or float(armature.get("fk_ik", 0.0)) < 0.5
         ):
             continue
         pointer = armature.as_pointer()
@@ -304,7 +303,10 @@ def _physical_ik_update_handler(_scene, *_args) -> None:
             continue
         _IK_UPDATE_GUARD.add(pointer)
         try:
-            update_physical_ik(armature)
+            if hasattr(armature, "duck_mouth_open"):
+                _apply_mouth_pose(armature, float(armature.duck_mouth_open))
+            if float(armature.get("fk_ik", 0.0)) >= 0.5:
+                update_physical_ik(armature)
         except (MotionError, ProfileError, ValueError):
             armature["duck_ik_update_error"] = True
         finally:

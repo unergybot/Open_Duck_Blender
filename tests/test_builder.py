@@ -824,6 +824,11 @@ class SceneBuilderTests(unittest.TestCase):
         bpy.context.scene.frame_set(26)
         self.assertAlmostEqual(armature.pose.bones["child"].rotation_euler.z, 0.4, places=6)
         self.assertAlmostEqual(armature.duck_mouth_open, 1.0, places=6)
+        self.assertAlmostEqual(
+            armature.pose.bones["mouth::lower_beak"].matrix_basis.translation.x,
+            0.01,
+            places=6,
+        )
         bpy.context.scene.frame_set(51)
         self.assertAlmostEqual(armature.location.x, 0.5, places=6)
 
