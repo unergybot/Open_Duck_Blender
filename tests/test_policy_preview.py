@@ -1,13 +1,18 @@
+import io
 import hashlib
 import json
 import math
 from pathlib import Path
+import sys
 import tempfile
+import time
 import unittest
+from unittest import mock
 
 from open_duck_tools.policy_preview import (
     PolicyPreviewError,
     PreviewConfig,
+    PreviewProcess,
     preview_action_name,
     temporary_output_path,
     validate_preview_config,
@@ -117,3 +122,107 @@ class PreviewConfigurationTests(unittest.TestCase):
             preview_action_name((-0.0, 0.0001, -0.0001)),
             "PolicyWalk_x0.00_y0.00_yaw0.00",
         )
+
+
+class FakeProcess:
+    def __init__(self, output=b"", returncode=None):
+        self.stdout = io.BytesIO(output)
+        self.returncode = returncode
+        self.terminated = 0
+        self.killed = 0
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.terminated += 1
+
+    def kill(self):
+        self.killed += 1
+        self.returncode = -9
+
+
+class PreviewProcessTests(unittest.TestCase):
+    def validated(self, root: Path):
+        runtime, rollout, policy = PreviewConfigurationTests().write_sources(root)
+        config = PreviewConfig(runtime, rollout, policy, (0.3, 0.0, 0.0), 4.0, 0, root / "cache")
+        return validate_preview_config(config, which=lambda _name: sys.executable)
+
+    def test_reader_drains_large_output_and_keeps_only_tail(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            validated = self.validated(root)
+            output = temporary_output_path(validated)
+            fake = FakeProcess(output=b"x" * 200000 + b"TAIL-MARKER", returncode=0)
+            job = PreviewProcess.start(
+                validated,
+                output,
+                popen_factory=lambda *args, **kwargs: fake,
+                log_limit_bytes=32768,
+            )
+            deadline = time.monotonic() + 10.0
+            outcome = None
+            while outcome is None and time.monotonic() < deadline:
+                outcome = job.poll()
+                time.sleep(0.01)
+            job.close()
+
+        self.assertIsNotNone(outcome)
+        self.assertEqual(outcome.returncode, 0)
+        self.assertIn("TAIL-MARKER", outcome.log_tail)
+        self.assertLessEqual(len(outcome.log_tail.encode()), 32768)
+
+    def test_launch_arguments_are_exact_and_shell_is_false(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            validated = self.validated(root)
+            output = temporary_output_path(validated)
+            fake = FakeProcess(returncode=0)
+            factory = mock.Mock(return_value=fake)
+            job = PreviewProcess.start(validated, output, popen_factory=factory)
+            while job.poll() is None:
+                time.sleep(0.001)
+            job.close()
+
+        args, kwargs = factory.call_args
+        self.assertEqual(args[0], validated.argv_for(output))
+        self.assertEqual(kwargs["cwd"], str(validated.cwd))
+        self.assertFalse(kwargs["shell"])
+        self.assertEqual(kwargs["stderr"], __import__("subprocess").STDOUT)
+
+    def test_cancel_terminates_then_kills_after_grace_period(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            validated = self.validated(root)
+            output = temporary_output_path(validated)
+            fake = FakeProcess()
+            now = [10.0]
+            job = PreviewProcess.start(
+                validated,
+                output,
+                popen_factory=lambda *args, **kwargs: fake,
+                clock=lambda: now[0],
+                cancel_grace_s=0.5,
+            )
+            job.request_cancel()
+            self.assertEqual(fake.terminated, 1)
+            self.assertIsNone(job.poll())
+            now[0] = 10.6
+            outcome = job.poll()
+            job.close()
+
+        self.assertEqual(fake.killed, 1)
+        self.assertTrue(outcome.cancelled)
+        self.assertEqual(outcome.returncode, -9)
+
+    def test_force_close_kills_live_child_and_removes_temporary_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            validated = self.validated(root)
+            output = temporary_output_path(validated)
+            output.write_bytes(b"partial")
+            fake = FakeProcess()
+            job = PreviewProcess.start(validated, output, popen_factory=lambda *a, **k: fake)
+            job.close(force=True)
+            self.assertEqual(fake.killed, 1)
+            self.assertFalse(output.exists())

@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 import hashlib
 import json
 import math
 from pathlib import Path
 import shutil
+import subprocess
+import threading
+import time
 import uuid
 
 
@@ -68,6 +72,133 @@ class ValidatedPreview:
     @property
     def argv(self) -> tuple[str, ...]:
         return self.argv_for(self.cache_path)
+
+
+@dataclass(frozen=True)
+class ProcessOutcome:
+    returncode: int
+    cancelled: bool
+    log_tail: str
+
+
+class PreviewProcess:
+    """A nonblocking policy-export child process with a bounded output tail."""
+
+    def __init__(
+        self,
+        process,
+        output_path: Path,
+        *,
+        clock,
+        cancel_grace_s: float,
+        log_limit_bytes: int,
+    ):
+        self._process = process
+        self._output_path = Path(output_path)
+        self._clock = clock
+        self._cancel_grace_s = cancel_grace_s
+        self._log_limit_bytes = log_limit_bytes
+        self._tail = bytearray()
+        self._tail_lock = threading.Lock()
+        self._reader_done = threading.Event()
+        self._reader = threading.Thread(target=self._drain_stdout, daemon=True)
+        self._cancelled = False
+        self._cancel_deadline = None
+        self._kill_requested = False
+        self._outcome = None
+        self._reader.start()
+
+    @classmethod
+    def start(
+        cls,
+        validated: ValidatedPreview,
+        output_path: Path,
+        *,
+        popen_factory=subprocess.Popen,
+        clock=time.monotonic,
+        log_limit_bytes: int = 32768,
+        cancel_grace_s: float = 2.0,
+    ) -> PreviewProcess:
+        process = popen_factory(
+            validated.argv_for(output_path),
+            cwd=str(validated.cwd),
+            shell=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        return cls(
+            process,
+            output_path,
+            clock=clock,
+            cancel_grace_s=cancel_grace_s,
+            log_limit_bytes=log_limit_bytes,
+        )
+
+    def _drain_stdout(self) -> None:
+        stdout = self._process.stdout
+        try:
+            while True:
+                chunk = stdout.read(4096)
+                if not chunk:
+                    return
+                with self._tail_lock:
+                    self._tail.extend(chunk)
+                    excess = len(self._tail) - self._log_limit_bytes
+                    if excess > 0:
+                        del self._tail[:excess]
+        except (OSError, ValueError):
+            pass
+        finally:
+            self._reader_done.set()
+
+    def _close_stdout(self) -> None:
+        stdout = self._process.stdout
+        if stdout is not None:
+            stdout.close()
+
+    def poll(self) -> ProcessOutcome | None:
+        returncode = self._process.poll()
+        if (
+            returncode is None
+            and self._cancel_deadline is not None
+            and not self._kill_requested
+            and self._clock() >= self._cancel_deadline
+        ):
+            self._process.kill()
+            self._kill_requested = True
+            returncode = self._process.poll()
+        if returncode is None or not self._reader_done.is_set():
+            return None
+        if self._outcome is None:
+            with self._tail_lock:
+                log_tail = bytes(self._tail).decode(errors="replace")
+            self._outcome = ProcessOutcome(returncode, self._cancelled, log_tail)
+        return self._outcome
+
+    def request_cancel(self) -> None:
+        if self._cancelled:
+            return
+        self._cancelled = True
+        self._cancel_deadline = self._clock() + self._cancel_grace_s
+        if self._process.poll() is None:
+            self._process.terminate()
+
+    def close(self, force: bool = False) -> None:
+        if force:
+            if self._process.poll() is None:
+                self._process.kill()
+            self._close_stdout()
+            self._reader.join(0.25)
+            self._output_path.unlink(missing_ok=True)
+            return
+
+        outcome = self.poll()
+        if outcome is None:
+            return
+        self._reader.join()
+        self._close_stdout()
+        if outcome.cancelled or outcome.returncode != 0:
+            self._output_path.unlink(missing_ok=True)
 
 
 def _canonical_float(value: float) -> str:
