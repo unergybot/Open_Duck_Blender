@@ -7,7 +7,9 @@ from dataclasses import dataclass
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
+import signal
 import shutil
 import subprocess
 import threading
@@ -94,6 +96,7 @@ class PreviewProcess:
         log_limit_bytes: int,
     ):
         self._process = process
+        self._process_group_id = process.pid
         self._output_path = Path(output_path)
         self._clock = clock
         self._cancel_grace_s = cancel_grace_s
@@ -125,6 +128,7 @@ class PreviewProcess:
             shell=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            start_new_session=True,
         )
         return cls(
             process,
@@ -154,17 +158,25 @@ class PreviewProcess:
     def _close_stdout(self) -> None:
         stdout = self._process.stdout
         if stdout is not None:
-            stdout.close()
+            try:
+                stdout.close()
+            except (OSError, ValueError):
+                pass
+
+    def _signal_process_group(self, requested_signal: int) -> None:
+        try:
+            os.killpg(self._process_group_id, requested_signal)
+        except ProcessLookupError:
+            pass
 
     def poll(self) -> ProcessOutcome | None:
         returncode = self._process.poll()
         if (
-            returncode is None
-            and self._cancel_deadline is not None
+            self._cancel_deadline is not None
             and not self._kill_requested
             and self._clock() >= self._cancel_deadline
         ):
-            self._process.kill()
+            self._signal_process_group(signal.SIGKILL)
             self._kill_requested = True
             returncode = self._process.poll()
         if returncode is None or not self._reader_done.is_set():
@@ -180,26 +192,30 @@ class PreviewProcess:
             return
         self._cancelled = True
         self._cancel_deadline = self._clock() + self._cancel_grace_s
-        if self._process.poll() is None:
-            self._process.terminate()
+        self._signal_process_group(signal.SIGTERM)
 
     def close(self, force: bool = False) -> None:
         if force:
-            if self._process.poll() is None:
-                self._process.kill()
-                try:
-                    self._process.wait(timeout=0.25)
-                except subprocess.TimeoutExpired:
-                    pass
+            self._signal_process_group(signal.SIGKILL)
+            self._kill_requested = True
+            try:
+                self._process.wait(timeout=0.25)
+            except subprocess.TimeoutExpired:
+                pass
             self._reader.join(0.25)
-            if self._reader_done.is_set():
-                self._close_stdout()
+            self._close_stdout()
+            if self._reader.is_alive():
+                self._reader.join(0.25)
             self._output_path.unlink(missing_ok=True)
             return
 
         outcome = self.poll()
         if outcome is None:
             return
+        try:
+            self._process.wait(timeout=0)
+        except subprocess.TimeoutExpired:
+            pass
         self._reader.join()
         self._close_stdout()
         if outcome.cancelled or outcome.returncode != 0:
@@ -262,8 +278,19 @@ def validate_preview_config(
         raise PolicyPreviewError("duration must be positive")
     exact_frames = duration_s * CONTROL_HZ
     frames = round(exact_frames)
-    if not math.isclose(exact_frames, frames, rel_tol=0.0, abs_tol=1e-9):
+    normalized_duration_s = frames / CONTROL_HZ
+    float32_tolerance = max(
+        math.ulp(normalized_duration_s),
+        abs(normalized_duration_s) * (2.0**-24),
+    )
+    if not math.isclose(
+        duration_s,
+        normalized_duration_s,
+        rel_tol=0.0,
+        abs_tol=float32_tolerance,
+    ):
         raise PolicyPreviewError("duration must resolve to an integral number of 50 Hz frames")
+    duration_s = normalized_duration_s
 
     try:
         seed = int(config.seed)

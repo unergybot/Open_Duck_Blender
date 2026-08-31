@@ -1,6 +1,7 @@
 import math
 import json
 import unittest
+from dataclasses import replace
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -18,7 +19,7 @@ from open_duck_tools.policy_preview import (
     PreviewConfig,
     validate_preview_config,
 )
-from open_duck_tools.profile import profile_to_json
+from open_duck_tools.profile import MouthSample, profile_to_json
 from tests.test_motion_import import (
     action_payload,
     build_minimal_rig,
@@ -158,7 +159,11 @@ class PolicyPreviewPanelTests(unittest.TestCase):
         self.assertIn(
             (
                 "operator",
-                {"id": "duck.generate_policy_preview", "icon": "FILE_REFRESH"},
+                {
+                    "id": "duck.generate_policy_preview",
+                    "text": "Generate & Import",
+                    "icon": "FILE_REFRESH",
+                },
                 True,
             ),
             calls,
@@ -198,7 +203,11 @@ class PolicyPreviewPanelTests(unittest.TestCase):
         self.assertIn(
             (
                 "operator",
-                {"id": "duck.generate_policy_preview", "icon": "FILE_REFRESH"},
+                {
+                    "id": "duck.generate_policy_preview",
+                    "text": "Generate & Import",
+                    "icon": "FILE_REFRESH",
+                },
                 False,
             ),
             calls,
@@ -234,8 +243,19 @@ class PolicyPreviewOperatorTests(unittest.TestCase):
     def setUp(self):
         bpy.ops.wm.read_factory_settings(use_empty=True)
         addon.register()
-        self.profile = test_profile()
+        base_profile = test_profile()
+        mouth_sample = MouthSample(0.0, {})
+        self.profile = replace(
+            base_profile,
+            robot_id="microduck-alpha",
+            mouth=replace(
+                base_profile.mouth,
+                samples=(mouth_sample,),
+                validation_poses=(mouth_sample,),
+            ),
+        )
         self.armature = build_minimal_rig(self.profile)
+        self.armature["duck_robot_id"] = self.profile.robot_id
         self.armature.data["duck_robot_profile_json"] = profile_to_json(self.profile)
         bpy.context.view_layer.objects.active = self.armature
         self.armature.select_set(True)
@@ -249,6 +269,9 @@ class PolicyPreviewOperatorTests(unittest.TestCase):
         exporter.parent.mkdir(parents=True)
         policy.write_bytes(b"policy")
         exporter.write_text("raise SystemExit(0)\n")
+        self.armature.duck_microduck_root = str(runtime)
+        self.armature.duck_microduck_rl_root = str(rollout)
+        self.armature.duck_policy_path = str(policy)
         self.validated = validate_preview_config(
             PreviewConfig(
                 runtime, rollout, policy, (0.3, 0.0, 0.0), 0.06, 0, root / "cache"
@@ -492,6 +515,155 @@ class PolicyPreviewOperatorTests(unittest.TestCase):
         self.assertIsNone(addon._poll_policy_preview_job())
         self.assertIsNone(addon._POLICY_PREVIEW_SESSION)
         self.assertEqual(self.armature.duck_policy_status, "Cancelled")
+
+    def test_generation_requires_declared_and_embedded_microduck_identity(self):
+        cases = (
+            ("other-duck", self.profile),
+            (
+                "microduck-alpha",
+                replace(self.profile, robot_id="other-duck"),
+            ),
+        )
+        for declared_robot_id, profile in cases:
+            with self.subTest(
+                declared_robot_id=declared_robot_id,
+                profile_robot_id=profile.robot_id,
+            ):
+                self.armature["duck_robot_id"] = declared_robot_id
+                self.armature.data["duck_robot_profile_json"] = profile_to_json(profile)
+                with mock.patch.object(addon.PreviewProcess, "start") as start:
+                    result = addon._start_policy_preview(self.armature, bpy.context)
+
+                try:
+                    self.assertEqual(result, {"CANCELLED"})
+                    self.assertIsNone(addon._POLICY_PREVIEW_SESSION)
+                    start.assert_not_called()
+                finally:
+                    addon._clear_policy_preview_job(force=True)
+
+    def test_wrong_owner_cannot_cancel_live_session_from_python_or_operator_search(self):
+        process = FakePreviewProcess()
+        output = self.validated.cache_path.with_name("owned.npz")
+        self.install_session(process, output)
+        wrong_owner = build_minimal_rig(self.profile)
+        wrong_owner["duck_robot_id"] = "microduck-alpha"
+        wrong_owner.data["duck_robot_profile_json"] = profile_to_json(self.profile)
+        self.armature.select_set(False)
+        wrong_owner.select_set(True)
+        bpy.context.view_layer.objects.active = wrong_owner
+
+        self.assertFalse(bpy.ops.duck.cancel_policy_preview.poll())
+        result = addon.DUCK_OT_cancel_policy_preview.execute(
+            SimpleNamespace(), bpy.context
+        )
+
+        self.assertEqual(result, {"CANCELLED"})
+        self.assertEqual(process.cancel_requests, 0)
+        self.assertIsNotNone(addon._POLICY_PREVIEW_SESSION)
+
+    def test_blender_duration_property_normalizes_argv_cache_and_provenance(self):
+        cases = (
+            (
+                0.02,
+                1,
+                "0.02",
+                "d7dae6bf54b8af080af43e71a54d262317c76b48281ceb4c555848932f9a370f",
+            ),
+            (
+                0.06,
+                3,
+                "0.059999999999999998",
+                "dfdb079540035d4b9b57d40e463aaf5501e6b5901112e05894048f24a9fea6d2",
+            ),
+            (
+                0.10,
+                5,
+                "0.10000000000000001",
+                "fd0457d6d84ef0e59beaed2205435a29f263215bc06bd3ef3dd140d30ab16fa5",
+            ),
+        )
+        for duration, frames, cli_duration, provenance in cases:
+            with self.subTest(duration=duration):
+                self.armature.duck_policy_duration = duration
+                cache_root = Path(self.temporary.name) / f"property-cache-{frames}"
+                process = FakePreviewProcess()
+
+                def validate_with_uv(config):
+                    return validate_preview_config(
+                        config, which=lambda _name: "/usr/bin/uv"
+                    )
+
+                with mock.patch.object(
+                    addon, "_policy_preview_cache_root", return_value=cache_root
+                ), mock.patch.object(
+                    addon,
+                    "validate_preview_config",
+                    side_effect=validate_with_uv,
+                ), mock.patch.object(
+                    addon.PreviewProcess, "start", return_value=process
+                ) as start, mock.patch.object(addon, "_ensure_policy_preview_timer"):
+                    result = addon._start_policy_preview(self.armature, bpy.context)
+
+                try:
+                    self.assertEqual(result, {"FINISHED"})
+                    validated = start.call_args.args[0]
+                    duration_index = validated.argv.index("--duration") + 1
+                    self.assertEqual(validated.frames, frames)
+                    self.assertEqual(validated.config.duration_s, duration)
+                    self.assertEqual(validated.argv[duration_index], cli_duration)
+                    self.assertEqual(
+                        json.loads(validated.canonical_config_json)["duration_s"],
+                        cli_duration,
+                    )
+                    self.assertEqual(validated.rollout_config_sha256, provenance)
+
+                    exact = validate_preview_config(
+                        PreviewConfig(
+                            Path(self.armature.duck_microduck_root),
+                            Path(self.armature.duck_microduck_rl_root),
+                            Path(self.armature.duck_policy_path),
+                            (
+                                self.armature.duck_policy_forward,
+                                self.armature.duck_policy_lateral,
+                                self.armature.duck_policy_yaw,
+                            ),
+                            duration,
+                            0,
+                            cache_root,
+                        ),
+                        which=lambda _name: "/usr/bin/uv",
+                    )
+                    self.assertEqual(validated.cache_key, exact.cache_key)
+                finally:
+                    addon._clear_policy_preview_job(force=True)
+
+    def test_blender_duration_property_rejects_nonintegral_value(self):
+        self.armature.duck_policy_duration = 0.031
+        with mock.patch.object(addon.PreviewProcess, "start") as start:
+            result = addon._start_policy_preview(self.armature, bpy.context)
+
+        self.assertEqual(result, {"CANCELLED"})
+        start.assert_not_called()
+
+    def test_load_pre_and_atexit_force_process_cleanup(self):
+        for cleanup in (
+            addon._policy_preview_load_pre_handler,
+            addon._atexit_policy_preview_cleanup,
+        ):
+            with self.subTest(cleanup=cleanup.__name__):
+                process = FakePreviewProcess()
+                output = self.validated.cache_path.with_name(
+                    f"{cleanup.__name__}.npz"
+                )
+                output.write_bytes(b"partial")
+                self.install_session(process, output)
+
+                cleanup()
+
+                self.assertEqual(process.closed, [True])
+                self.assertIsNone(addon._POLICY_PREVIEW_SESSION)
+                if cleanup is addon._policy_preview_load_pre_handler:
+                    self.assertFalse(output.exists())
 
     def test_unregister_force_closes_child_and_removes_timer(self):
         process = FakePreviewProcess()

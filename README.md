@@ -217,7 +217,7 @@ Generating a new preview requires `uv`, `~/MyCode/microduck`, and
 self-contained.
 
 1. Select `MicroduckRig` and open `N` → **Open Duck**.
-2. Expand **Generate Policy Preview**.
+2. Find **Generate Policy Preview** in the sidebar.
 3. Keep `alpha_walking.onnx` or choose another compatible walking policy.
 4. Set **Forward/Lateral/Yaw**, **Duration**, and **Seed**.
 5. Press **Generate & Import**; continue using Blender or press **Cancel**.

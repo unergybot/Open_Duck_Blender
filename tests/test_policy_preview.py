@@ -2,7 +2,10 @@ import io
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -93,6 +96,90 @@ class PreviewConfigurationTests(unittest.TestCase):
                 with self.subTest(message=message), self.assertRaisesRegex(PolicyPreviewError, message):
                     validate_preview_config(config, which=lambda _name: "/usr/bin/uv")
 
+    def test_normalizes_blender_float32_durations_for_every_downstream_identity(self):
+        cases = (
+            (
+                0.019999999552965164,
+                0.02,
+                1,
+                "0.02",
+                "165a857f3ffc3259ff6b914f2ccd1eba84973b6d42d646a5258a26b8af8d9f9c",
+            ),
+            (
+                0.05999999865889549,
+                0.06,
+                3,
+                "0.059999999999999998",
+                "d5921fd5d7d846e4f04ac106374fa0c972f1aa6554793fcc6092d4f9b32982da",
+            ),
+            (
+                0.10000000149011612,
+                0.10,
+                5,
+                "0.10000000000000001",
+                "9be3c4ba1eee2326dcf8b9dace73131bc86a942eb654288e233fb51f55c6d8e8",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime, rollout, policy = self.write_sources(root)
+            for raw_duration, normalized, frames, cli_duration, provenance in cases:
+                with self.subTest(raw_duration=raw_duration):
+                    config = PreviewConfig(
+                        runtime,
+                        rollout,
+                        policy,
+                        (0.3, 0.0, 0.0),
+                        raw_duration,
+                        0,
+                        root / f"cache-{frames}",
+                    )
+                    validated = validate_preview_config(
+                        config, which=lambda _name: "/usr/bin/uv"
+                    )
+                    exact = validate_preview_config(
+                        PreviewConfig(
+                            runtime,
+                            rollout,
+                            policy,
+                            (0.3, 0.0, 0.0),
+                            normalized,
+                            0,
+                            root / f"cache-{frames}",
+                        ),
+                        which=lambda _name: "/usr/bin/uv",
+                    )
+
+                    duration_index = validated.argv.index("--duration") + 1
+                    self.assertEqual(validated.frames, frames)
+                    self.assertEqual(validated.config.duration_s, normalized)
+                    self.assertEqual(validated.argv[duration_index], cli_duration)
+                    self.assertEqual(
+                        json.loads(validated.canonical_config_json)["duration_s"],
+                        cli_duration,
+                    )
+                    self.assertEqual(validated.rollout_config_sha256, provenance)
+                    self.assertEqual(validated.cache_key, exact.cache_key)
+
+    def test_rejects_blender_float32_nonintegral_duration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime, rollout, policy = self.write_sources(root)
+            config = PreviewConfig(
+                runtime,
+                rollout,
+                policy,
+                (0.3, 0.0, 0.0),
+                0.03099999949336052,
+                0,
+                root / "cache",
+            )
+
+            with self.assertRaisesRegex(
+                PolicyPreviewError, "integral number of 50 Hz frames"
+            ):
+                validate_preview_config(config, which=lambda _name: "/usr/bin/uv")
+
     def test_reports_each_missing_dependency(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -126,11 +213,13 @@ class PreviewConfigurationTests(unittest.TestCase):
 
 
 class FakeProcess:
-    def __init__(self, output=b"", returncode=None):
+    def __init__(self, output=b"", returncode=None, pid=43210):
         self.stdout = io.BytesIO(output)
         self.returncode = returncode
+        self.pid = pid
         self.terminated = 0
         self.killed = 0
+        self.waits = []
 
     def poll(self):
         return self.returncode
@@ -143,6 +232,7 @@ class FakeProcess:
         self.returncode = -9
 
     def wait(self, timeout=None):
+        self.waits.append(timeout)
         if self.returncode is None:
             raise subprocess.TimeoutExpired("fake", timeout)
         return self.returncode
@@ -195,31 +285,71 @@ class PreviewProcessTests(unittest.TestCase):
         self.assertEqual(kwargs["cwd"], str(validated.cwd))
         self.assertFalse(kwargs["shell"])
         self.assertEqual(kwargs["stderr"], __import__("subprocess").STDOUT)
+        self.assertTrue(kwargs["start_new_session"])
 
-    def test_cancel_terminates_then_kills_after_grace_period(self):
+    def test_cancel_terms_then_kills_the_dedicated_process_group(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             validated = self.validated(root)
             output = temporary_output_path(validated)
             fake = FakeProcess()
             now = [10.0]
-            job = PreviewProcess.start(
-                validated,
-                output,
-                popen_factory=lambda *args, **kwargs: fake,
-                clock=lambda: now[0],
-                cancel_grace_s=0.5,
-            )
-            job.request_cancel()
-            self.assertEqual(fake.terminated, 1)
-            self.assertIsNone(job.poll())
-            now[0] = 10.6
-            outcome = job.poll()
-            job.close()
+            signals = []
 
-        self.assertEqual(fake.killed, 1)
+            def signal_group(process_group, requested_signal):
+                signals.append((process_group, requested_signal))
+                if requested_signal == signal.SIGKILL:
+                    fake.returncode = -signal.SIGKILL
+
+            with mock.patch("os.killpg", side_effect=signal_group):
+                job = PreviewProcess.start(
+                    validated,
+                    output,
+                    popen_factory=lambda *args, **kwargs: fake,
+                    clock=lambda: now[0],
+                    cancel_grace_s=0.5,
+                )
+                job.request_cancel()
+                self.assertIsNone(job.poll())
+                now[0] = 10.6
+                outcome = job.poll()
+                job.close()
+
+        self.assertEqual(
+            signals,
+            [(fake.pid, signal.SIGTERM), (fake.pid, signal.SIGKILL)],
+        )
         self.assertTrue(outcome.cancelled)
         self.assertEqual(outcome.returncode, -9)
+
+    def test_cancel_escalates_group_after_wrapper_already_exited(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            validated = self.validated(root)
+            output = temporary_output_path(validated)
+            fake = FakeProcess(returncode=-signal.SIGKILL)
+            now = [10.0]
+            with mock.patch("os.killpg") as killpg:
+                job = PreviewProcess.start(
+                    validated,
+                    output,
+                    popen_factory=lambda *args, **kwargs: fake,
+                    clock=lambda: now[0],
+                    cancel_grace_s=0.5,
+                )
+                job.request_cancel()
+                now[0] = 10.6
+                outcome = job.poll()
+                job.close()
+
+        self.assertEqual(
+            killpg.call_args_list,
+            [
+                mock.call(fake.pid, signal.SIGTERM),
+                mock.call(fake.pid, signal.SIGKILL),
+            ],
+        )
+        self.assertTrue(outcome.cancelled)
 
     def test_force_close_kills_live_child_and_removes_temporary_output(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -229,8 +359,15 @@ class PreviewProcessTests(unittest.TestCase):
             output.write_bytes(b"partial")
             fake = FakeProcess()
             job = PreviewProcess.start(validated, output, popen_factory=lambda *a, **k: fake)
-            job.close(force=True)
-            self.assertEqual(fake.killed, 1)
+            with mock.patch(
+                "os.killpg",
+                side_effect=lambda _group, _signal: setattr(
+                    fake, "returncode", -signal.SIGKILL
+                ),
+            ) as killpg:
+                job.close(force=True)
+            killpg.assert_called_once_with(fake.pid, signal.SIGKILL)
+            self.assertEqual(fake.waits, [0.25])
             self.assertFalse(output.exists())
 
     def test_force_close_bounds_cleanup_terminates_reader_and_reaps_live_subprocess(self):
@@ -251,6 +388,7 @@ class PreviewProcessTests(unittest.TestCase):
                     ],
                     stdout=kwargs["stdout"],
                     stderr=kwargs["stderr"],
+                    start_new_session=kwargs["start_new_session"],
                 )
                 return child
 
@@ -271,3 +409,99 @@ class PreviewProcessTests(unittest.TestCase):
                 if child.poll() is None:
                     child.kill()
                     child.wait(timeout=1.0)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux process groups only")
+    def test_real_uv_orphan_descendant_is_killed_and_reaped_after_wrapper_exit(self):
+        uv = shutil.which("uv")
+        self.assertIsNotNone(uv)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime, rollout, policy = PreviewConfigurationTests().write_sources(root)
+            exporter = rollout / "scripts/export_policy_rollout.py"
+            exporter.write_text(
+                """\
+import os
+from pathlib import Path
+import signal
+import sys
+import time
+
+output = Path(sys.argv[sys.argv.index(\"--output\") + 1])
+Path(str(output) + \".exporter-pid\").write_text(str(os.getpid()))
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+print(\"EXPORTER_READY\", flush=True)
+while True:
+    time.sleep(0.05)
+"""
+            )
+            validated = validate_preview_config(
+                PreviewConfig(
+                    runtime,
+                    rollout,
+                    policy,
+                    (0.3, 0.0, 0.0),
+                    0.02,
+                    0,
+                    root / "cache",
+                ),
+                which=lambda _name: uv,
+            )
+            output = temporary_output_path(validated)
+            pid_path = Path(str(output) + ".exporter-pid")
+            wrapper = None
+            exporter_pid = None
+            exporter_process_group = None
+
+            def capture_wrapper(*args, **kwargs):
+                nonlocal wrapper
+                wrapper = subprocess.Popen(*args, **kwargs)
+                return wrapper
+
+            job = PreviewProcess.start(
+                validated,
+                output,
+                popen_factory=capture_wrapper,
+                cancel_grace_s=0.1,
+            )
+            try:
+                deadline = time.monotonic() + 10.0
+                while not pid_path.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(pid_path.exists(), "real uv exporter never became ready")
+                exporter_pid = int(pid_path.read_text())
+                self.assertNotEqual(wrapper.pid, exporter_pid)
+
+                os.kill(wrapper.pid, signal.SIGKILL)
+                while wrapper.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertIsNotNone(wrapper.returncode)
+                self.assertTrue(Path(f"/proc/{exporter_pid}").exists())
+                exporter_process_group = os.getpgid(exporter_pid)
+
+                job.request_cancel()
+                outcome = None
+                deadline = time.monotonic() + 5.0
+                while outcome is None and time.monotonic() < deadline:
+                    outcome = job.poll()
+                    time.sleep(0.01)
+
+                self.assertIsNotNone(outcome)
+                self.assertTrue(outcome.cancelled)
+            finally:
+                if exporter_pid is not None and Path(f"/proc/{exporter_pid}").exists():
+                    try:
+                        os.kill(exporter_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                job.close(force=True)
+                deadline = time.monotonic() + 2.0
+                while (
+                    exporter_pid is not None
+                    and Path(f"/proc/{exporter_pid}").exists()
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.01)
+
+            self.assertFalse(Path(f"/proc/{wrapper.pid}").exists())
+            self.assertFalse(Path(f"/proc/{exporter_pid}").exists())
+            self.assertEqual(exporter_process_group, wrapper.pid)

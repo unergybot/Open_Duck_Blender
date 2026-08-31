@@ -55,7 +55,7 @@ class _PolicyPreviewSession:
     scene_name: str
     validated: ValidatedPreview
     output_path: Path
-    process: PreviewProcess
+    process: PreviewProcess | None
 
 
 _POLICY_PREVIEW_SESSION: _PolicyPreviewSession | None = None
@@ -646,12 +646,17 @@ class DUCK_OT_import_motion(bpy.types.Operator, ImportHelper):
 
 
 def _is_profiled_microduck(armature) -> bool:
-    return bool(
+    if not (
         armature is not None
         and armature.type == "ARMATURE"
         and armature.data is not None
-        and armature.data.get("duck_robot_profile_json")
-    )
+        and armature.get("duck_robot_id") == "microduck-alpha"
+    ):
+        return False
+    try:
+        return profile_from_armature(armature).robot_id == "microduck-alpha"
+    except ProfileError:
+        return False
 
 
 def _bounded_policy_preview_details(value) -> str:
@@ -734,10 +739,11 @@ def _clear_policy_preview_job(*, force=True) -> None:
         bpy.app.timers.unregister(_poll_policy_preview_job)
     if session is None:
         return
-    try:
-        session.process.close(force=force)
-    except Exception:
-        pass
+    if session.process is not None:
+        try:
+            session.process.close(force=force)
+        except Exception:
+            pass
     try:
         session.output_path.unlink(missing_ok=True)
     except OSError:
@@ -747,6 +753,9 @@ def _clear_policy_preview_job(*, force=True) -> None:
 def _poll_policy_preview_job():
     session = _POLICY_PREVIEW_SESSION
     if session is None:
+        return None
+    if session.process is None:
+        _clear_policy_preview_job(force=True)
         return None
     armature = _resolve_policy_preview_armature(session)
     if armature is None:
@@ -901,7 +910,7 @@ def _start_policy_preview(armature, context):
 
 class DUCK_OT_generate_policy_preview(bpy.types.Operator):
     bl_idname = "duck.generate_policy_preview"
-    bl_label = "Generate Policy Preview"
+    bl_label = "Generate & Import"
     bl_description = "Generate and import a walking preview from an ONNX policy"
 
     @classmethod
@@ -922,14 +931,22 @@ class DUCK_OT_cancel_policy_preview(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
+        session = _POLICY_PREVIEW_SESSION
         return (
-            _POLICY_PREVIEW_SESSION is not None
+            session is not None
             and _is_profiled_microduck(context.object)
+            and context.object.as_pointer() == session.armature_pointer
         )
 
-    def execute(self, _context):
+    def execute(self, context):
         session = _POLICY_PREVIEW_SESSION
-        if session is None:
+        if (
+            session is None
+            or context.object is None
+            or context.object.as_pointer() != session.armature_pointer
+            or not _is_profiled_microduck(context.object)
+            or session.process is None
+        ):
             return {"CANCELLED"}
         armature = _resolve_policy_preview_armature(session)
         if armature is None:
@@ -960,10 +977,11 @@ def _atexit_policy_preview_cleanup() -> None:
     session = _POLICY_PREVIEW_SESSION
     _POLICY_PREVIEW_SESSION = None
     if session is not None:
-        try:
-            session.process.close(force=True)
-        except Exception:
-            pass
+        if session.process is not None:
+            try:
+                session.process.close(force=True)
+            except Exception:
+                pass
 
 
 def _install_policy_preview_cleanup_hooks() -> None:
@@ -1085,13 +1103,21 @@ class DUCK_PT_tools(bpy.types.Panel):
                 preview.prop(armature, "duck_microduck_root")
                 preview.prop(armature, "duck_microduck_rl_root")
             if _POLICY_PREVIEW_SESSION is None:
-                preview.operator("duck.generate_policy_preview", icon="FILE_REFRESH")
+                preview.operator(
+                    "duck.generate_policy_preview",
+                    text="Generate & Import",
+                    icon="FILE_REFRESH",
+                )
             elif _POLICY_PREVIEW_SESSION.armature_pointer == armature.as_pointer():
                 preview.operator("duck.cancel_policy_preview", icon="CANCEL")
             else:
                 generate = preview.row()
                 generate.enabled = False
-                generate.operator("duck.generate_policy_preview", icon="FILE_REFRESH")
+                generate.operator(
+                    "duck.generate_policy_preview",
+                    text="Generate & Import",
+                    icon="FILE_REFRESH",
+                )
                 preview.label(text="Another policy preview is running", icon="INFO")
             preview.label(text=armature.duck_policy_status, icon="INFO")
             if armature.duck_policy_details:
