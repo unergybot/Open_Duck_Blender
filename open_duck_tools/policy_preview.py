@@ -153,6 +153,7 @@ class PreviewProcess:
         except (OSError, ValueError):
             pass
         finally:
+            self._close_stdout()
             self._reader_done.set()
 
     def _close_stdout(self) -> None:
@@ -169,16 +170,30 @@ class PreviewProcess:
         except ProcessLookupError:
             pass
 
+    def _process_group_exists(self) -> bool:
+        try:
+            os.killpg(self._process_group_id, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
     def poll(self) -> ProcessOutcome | None:
         returncode = self._process.poll()
-        if (
-            self._cancel_deadline is not None
-            and not self._kill_requested
-            and self._clock() >= self._cancel_deadline
-        ):
-            self._signal_process_group(signal.SIGKILL)
-            self._kill_requested = True
-            returncode = self._process.poll()
+        if self._cancel_deadline is not None:
+            group_exists = self._process_group_exists()
+            if (
+                group_exists
+                and not self._kill_requested
+                and self._clock() >= self._cancel_deadline
+            ):
+                self._signal_process_group(signal.SIGKILL)
+                self._kill_requested = True
+                group_exists = self._process_group_exists()
+                returncode = self._process.poll()
+            if group_exists:
+                return None
         if returncode is None or not self._reader_done.is_set():
             return None
         if self._outcome is None:
@@ -203,9 +218,8 @@ class PreviewProcess:
             except subprocess.TimeoutExpired:
                 pass
             self._reader.join(0.25)
-            self._close_stdout()
-            if self._reader.is_alive():
-                self._reader.join(0.25)
+            if self._reader_done.is_set():
+                self._close_stdout()
             self._output_path.unlink(missing_ok=True)
             return
 

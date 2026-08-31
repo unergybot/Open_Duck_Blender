@@ -9,6 +9,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -295,10 +296,16 @@ class PreviewProcessTests(unittest.TestCase):
             fake = FakeProcess()
             now = [10.0]
             signals = []
+            group_alive = [True]
 
             def signal_group(process_group, requested_signal):
                 signals.append((process_group, requested_signal))
+                if requested_signal == 0:
+                    if group_alive[0]:
+                        return
+                    raise ProcessLookupError
                 if requested_signal == signal.SIGKILL:
+                    group_alive[0] = False
                     fake.returncode = -signal.SIGKILL
 
             with mock.patch("os.killpg", side_effect=signal_group):
@@ -316,7 +323,7 @@ class PreviewProcessTests(unittest.TestCase):
                 job.close()
 
         self.assertEqual(
-            signals,
+            [entry for entry in signals if entry[1] != 0],
             [(fake.pid, signal.SIGTERM), (fake.pid, signal.SIGKILL)],
         )
         self.assertTrue(outcome.cancelled)
@@ -329,7 +336,19 @@ class PreviewProcessTests(unittest.TestCase):
             output = temporary_output_path(validated)
             fake = FakeProcess(returncode=-signal.SIGKILL)
             now = [10.0]
-            with mock.patch("os.killpg") as killpg:
+            signals = []
+            group_alive = [True]
+
+            def signal_group(process_group, requested_signal):
+                signals.append((process_group, requested_signal))
+                if requested_signal == 0:
+                    if group_alive[0]:
+                        return
+                    raise ProcessLookupError
+                if requested_signal == signal.SIGKILL:
+                    group_alive[0] = False
+
+            with mock.patch("os.killpg", side_effect=signal_group):
                 job = PreviewProcess.start(
                     validated,
                     output,
@@ -343,13 +362,93 @@ class PreviewProcessTests(unittest.TestCase):
                 job.close()
 
         self.assertEqual(
-            killpg.call_args_list,
-            [
-                mock.call(fake.pid, signal.SIGTERM),
-                mock.call(fake.pid, signal.SIGKILL),
-            ],
+            [entry for entry in signals if entry[1] != 0],
+            [(fake.pid, signal.SIGTERM), (fake.pid, signal.SIGKILL)],
         )
         self.assertTrue(outcome.cancelled)
+
+    def test_cancel_waits_for_process_group_after_wrapper_and_pipe_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            validated = self.validated(root)
+            output = temporary_output_path(validated)
+            fake = FakeProcess(returncode=-signal.SIGTERM)
+            now = [10.0]
+            group_alive = [True]
+            signals = []
+
+            def signal_group(process_group, requested_signal):
+                signals.append((process_group, requested_signal))
+                if requested_signal == 0:
+                    if group_alive[0]:
+                        return
+                    raise ProcessLookupError
+                if requested_signal == signal.SIGKILL:
+                    group_alive[0] = False
+
+            with mock.patch("os.killpg", side_effect=signal_group):
+                job = PreviewProcess.start(
+                    validated,
+                    output,
+                    popen_factory=lambda *args, **kwargs: fake,
+                    clock=lambda: now[0],
+                    cancel_grace_s=0.5,
+                )
+                job.request_cancel()
+                self.assertIsNone(job.poll())
+                now[0] = 10.6
+                outcome = job.poll()
+                job.close()
+
+        self.assertTrue(outcome.cancelled)
+        self.assertIn((fake.pid, 0), signals)
+        self.assertIn((fake.pid, signal.SIGKILL), signals)
+
+    def test_force_close_does_not_close_stdout_while_reader_is_blocked(self):
+        class BlockingStdout:
+            def __init__(self):
+                self.started = threading.Event()
+                self.release = threading.Event()
+                self.close_calls = 0
+
+            def read(self, _size):
+                self.started.set()
+                self.release.wait(5.0)
+                return b""
+
+            def close(self):
+                self.close_calls += 1
+                if not self.release.is_set():
+                    raise AssertionError("stdout closed while reader is blocked")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            validated = self.validated(root)
+            output = temporary_output_path(validated)
+            fake = FakeProcess()
+            fake.stdout = BlockingStdout()
+            job = PreviewProcess.start(
+                validated, output, popen_factory=lambda *args, **kwargs: fake
+            )
+            self.assertTrue(fake.stdout.started.wait(1.0))
+            try:
+                with mock.patch(
+                    "os.killpg",
+                    side_effect=lambda _group, _signal: setattr(
+                        fake, "returncode", -signal.SIGKILL
+                    ),
+                ):
+                    started = time.monotonic()
+                    job.close(force=True)
+                    elapsed = time.monotonic() - started
+                self.assertLess(elapsed, 0.75)
+                self.assertEqual(fake.stdout.close_calls, 0)
+            finally:
+                fake.stdout.release.set()
+                job._reader.join(1.0)
+
+            self.assertFalse(job._reader.is_alive())
+            self.assertEqual(fake.stdout.close_calls, 1)
 
     def test_force_close_kills_live_child_and_removes_temporary_output(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -429,7 +528,8 @@ import time
 output = Path(sys.argv[sys.argv.index(\"--output\") + 1])
 Path(str(output) + \".exporter-pid\").write_text(str(os.getpid()))
 signal.signal(signal.SIGTERM, signal.SIG_IGN)
-print(\"EXPORTER_READY\", flush=True)
+os.close(sys.stdout.fileno())
+os.close(sys.stderr.fileno())
 while True:
     time.sleep(0.05)
 """
