@@ -12,7 +12,7 @@ import bpy
 import numpy as np
 from mathutils import Matrix, Quaternion
 
-from open_duck_tools.builder import generate_microduck_scene
+from open_duck_tools.builder import _transform, generate_microduck_scene
 from open_duck_tools.motion import MotionError, build_motion_archive
 from open_duck_tools import addon
 from open_duck_tools.profile import ProfileError, build_microduck_profile
@@ -357,6 +357,27 @@ class SceneBuilderTests(unittest.TestCase):
         assert_matrix_almost_equal(
             self, bpy.data.objects["visual::jaw"].matrix_world, expected
         )
+
+    def test_normalizes_tiny_finite_nonzero_builder_quaternion(self):
+        actual = _transform(
+            (0.02, 0.03, 0.04),
+            (1e-13, 0.0, 0.0, 0.0),
+            field="tiny quaternion",
+        )
+        expected = Matrix.Translation((0.02, 0.03, 0.04))
+        assert_matrix_almost_equal(self, actual, expected)
+
+    def test_normalizes_huge_finite_builder_quaternion_without_overflow(self):
+        actual = _transform(
+            (0.02, 0.03, 0.04),
+            (1e308, 1e308, 0.0, 0.0),
+            field="huge quaternion",
+        )
+        expected = Matrix.Translation((0.02, 0.03, 0.04))
+        expected @= Quaternion(
+            (0.7071067811865476, 0.7071067811865476, 0.0, 0.0)
+        ).to_matrix().to_4x4()
+        assert_matrix_almost_equal(self, actual, expected)
 
     @unittest.skipUnless(
         all(

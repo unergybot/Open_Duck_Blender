@@ -29,8 +29,8 @@ def _transform(position, quaternion, *, field: str = "transform") -> Matrix:
         math.isfinite(component) for component in quaternion
     ):
         raise ProfileError(f"{field} quaternion must be four finite numbers")
-    norm = math.sqrt(sum(component * component for component in quaternion))
-    if norm < 1e-12:
+    norm = math.hypot(*quaternion)
+    if norm == 0.0:
         raise ProfileError(f"{field} quaternion cannot be zero")
     normalized = tuple(component / norm for component in quaternion)
     return Matrix.Translation(position) @ Quaternion(normalized).to_matrix().to_4x4()
