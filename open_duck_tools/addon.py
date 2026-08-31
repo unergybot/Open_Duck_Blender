@@ -659,7 +659,11 @@ class DUCK_PT_tools(bpy.types.Panel):
         layout.label(text=f"Robot: {armature.get('duck_robot_id')}")
         if armature.get("duck_robot_id") == "microduck-alpha":
             layout.prop(armature, "duck_colorway", text="Colourway")
-            layout.prop(armature, "duck_mouth_open", text="Mouth")
+            layout.prop(armature, "duck_mouth_open")
+        layout.label(
+            text="Mode: IK" if float(armature.get("fk_ik", 0.0)) >= 0.5 else "Mode: FK",
+            icon="CON_KINEMATIC" if float(armature.get("fk_ik", 0.0)) >= 0.5 else "BONE_DATA",
+        )
         row = layout.row(align=True)
         row.operator("duck.switch_fk")
         row.operator("duck.switch_ik")
@@ -678,6 +682,11 @@ class DUCK_PT_tools(bpy.types.Panel):
                 operator = presets.operator("duck.select_action", text=label)
                 operator.action_name = action_name
         active_action = armature.animation_data and armature.animation_data.action
+        if active_action and not bool(active_action.get("duck_contact_valid", True)):
+            animation.label(
+                text="Kinematic test only — ground contact is not guaranteed",
+                icon="ERROR",
+            )
         controls = animation.row(align=True)
         controls.enabled = bool(active_action)
         controls.operator(
@@ -735,7 +744,7 @@ def register():
         )
     if not hasattr(bpy.types.Object, "duck_mouth_open"):
         bpy.types.Object.duck_mouth_open = bpy.props.FloatProperty(
-            name="Mouth",
+            name="Mouth (visual approximation)",
             min=0.0,
             max=1.0,
             default=0.0,

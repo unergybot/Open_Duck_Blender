@@ -47,6 +47,13 @@ class AddonRegistrationTests(unittest.TestCase):
         self.assertIn(addon.DUCK_OT_import_motion, addon.CLASSES)
         self.assertTrue(hasattr(bpy.types.Object, "duck_colorway"))
 
+    def test_approximate_mouth_control_is_explicitly_labeled(self):
+        addon.register()
+        self.assertEqual(
+            bpy.types.Object.bl_rna.properties["duck_mouth_open"].name,
+            "Mouth (visual approximation)",
+        )
+
 class MotionImportOperatorTests(unittest.TestCase):
     def setUp(self):
         bpy.ops.wm.read_factory_settings(use_empty=True)

@@ -238,10 +238,50 @@ class BuildCliTests(unittest.TestCase):
                 bpy.data.objects["MicroduckRig"].duck_action_name,
                 "Policy_alpha_walking_forward",
             )
+            scene_children = {collection.name for collection in bpy.context.scene.collection.children}
+            self.assertEqual(scene_children, {"Microduck", "Presentation"})
+            microduck = bpy.data.collections["Microduck"]
+            self.assertEqual(
+                {collection.name for collection in microduck.children},
+                {"Rig", "Visuals", "Controls"},
+            )
+            self.assertEqual(
+                {obj.name for obj in bpy.data.collections["Rig"].objects},
+                {"MicroduckRig"},
+            )
+            self.assertEqual(
+                {obj.name for obj in bpy.data.collections["Visuals"].objects},
+                {"visual::jaw", "visual::jaw_soft"},
+            )
+            self.assertEqual(
+                {obj.name for obj in bpy.data.collections["Presentation"].objects},
+                {"Ground", "MicroduckCamera", "KeyLight", "FillLight"},
+            )
+            ground = bpy.data.objects["Ground"]
+            self.assertAlmostEqual(ground.matrix_world.translation.z, 0.0, places=7)
+            self.assertGreaterEqual(ground.dimensions.x, 0.65 - 1e-6)
+            self.assertGreaterEqual(ground.dimensions.y, 0.30 - 1e-6)
+            self.assertIs(bpy.context.scene.camera, bpy.data.objects["MicroduckCamera"])
+            armature = bpy.data.objects["MicroduckRig"]
+            self.assertEqual(armature.data.display_type, "STICK")
+            self.assertTrue(armature.show_in_front)
+            self.assertEqual(armature.mode, "OBJECT")
+            self.assertIs(bpy.context.view_layer.objects.active, armature)
+            self.assertEqual(armature["fk_ik"], 0.0)
             manifest = json.loads(
                 bpy.data.texts["microduck-build-manifest.json"].as_string()
             )
-            self.assertEqual(manifest["policy_motion_sha256"], policy_sha256)
+            self.assertEqual(manifest["schema_version"], 2)
+            self.assertEqual(
+                manifest["motion_sha256"],
+                {
+                    "KinematicCrouchTest": demo_sha256,
+                    "Policy_alpha_walking_forward": policy_sha256,
+                },
+            )
+            self.assertEqual(manifest["source_sha256"], armature.data["duck_robot_profile_json"] and json.loads(armature.data["duck_robot_profile_json"])["source_sha256"])
+            self.assertEqual(manifest["build_blender_version"], bpy.app.version_string)
+            self.assertEqual(manifest["mouth_mode"], "image-derived-approximation")
 
     def test_reports_all_missing_canonical_sources_before_build(self):
         with tempfile.TemporaryDirectory() as directory:

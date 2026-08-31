@@ -10,6 +10,8 @@ from pathlib import Path
 import sys
 
 import bpy
+from mathutils import Vector
+import numpy as np
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -20,6 +22,91 @@ from open_duck_tools.builder import generate_microduck_scene
 from open_duck_tools.motion import MotionError
 from open_duck_tools.motion_import import import_motion_action
 from open_duck_tools.profile import ProfileError, build_microduck_profile
+
+
+def _new_collection(name: str, parent) -> bpy.types.Collection:
+    collection = bpy.data.collections.get(name) or bpy.data.collections.new(name)
+    if collection.name not in {child.name for child in parent.children}:
+        parent.children.link(collection)
+    return collection
+
+
+def _move_object(obj, collection) -> None:
+    for current in tuple(obj.users_collection):
+        current.objects.unlink(obj)
+    collection.objects.link(obj)
+
+
+def _look_at(obj, target) -> None:
+    obj.rotation_euler = (Vector(target) - obj.location).to_track_quat(
+        "-Z", "Y"
+    ).to_euler()
+
+
+def _organize_release_scene(armature, policy_motion: Path) -> None:
+    scene = bpy.context.scene
+    root = scene.collection
+    for child in tuple(root.children):
+        root.children.unlink(child)
+    microduck = _new_collection("Microduck", root)
+    rig = _new_collection("Rig", microduck)
+    visuals = _new_collection("Visuals", microduck)
+    _new_collection("Controls", microduck)
+    presentation = _new_collection("Presentation", root)
+    _move_object(armature, rig)
+    for obj in tuple(bpy.data.objects):
+        if obj.name.startswith("visual::"):
+            _move_object(obj, visuals)
+
+    with np.load(policy_motion, allow_pickle=False) as archive:
+        positions = np.asarray(archive["body_pos_w"], dtype=np.float64)
+    minimum = positions.min(axis=(0, 1))
+    maximum = positions.max(axis=(0, 1))
+    center = 0.5 * (minimum + maximum)
+    x_min, x_max = minimum[0] - 0.075, maximum[0] + 0.075
+    y_center = center[1]
+    y_half = max(0.15, 0.5 * (maximum[1] - minimum[1]) + 0.075)
+    mesh = bpy.data.meshes.new("GroundMesh")
+    mesh.from_pydata(
+        (
+            (x_min, y_center - y_half, 0.0),
+            (x_max, y_center - y_half, 0.0),
+            (x_max, y_center + y_half, 0.0),
+            (x_min, y_center + y_half, 0.0),
+        ),
+        (),
+        ((0, 1, 2, 3),),
+    )
+    ground = bpy.data.objects.new("Ground", mesh)
+    presentation.objects.link(ground)
+
+    target = Vector((center[0], center[1], max(0.12, center[2])))
+    camera_data = bpy.data.cameras.new("MicroduckCamera")
+    camera_data.lens = 50.0
+    camera = bpy.data.objects.new("MicroduckCamera", camera_data)
+    camera.location = target + Vector((-0.82, -0.99, 0.66))
+    _look_at(camera, target)
+    presentation.objects.link(camera)
+    scene.camera = camera
+    for name, offset, energy, size in (
+        ("KeyLight", (-0.35, -0.55, 0.85), 700.0, 0.45),
+        ("FillLight", (0.65, 0.30, 0.50), 350.0, 0.35),
+    ):
+        light_data = bpy.data.lights.new(name, "AREA")
+        light_data.energy = energy
+        light_data.shape = "DISK"
+        light_data.size = size
+        light = bpy.data.objects.new(name, light_data)
+        light.location = target + Vector(offset)
+        _look_at(light, target)
+        presentation.objects.link(light)
+
+    armature.data.display_type = "STICK"
+    armature.show_in_front = True
+    bpy.ops.object.mode_set(mode="OBJECT") if armature.mode != "OBJECT" else None
+    bpy.ops.object.select_all(action="DESELECT")
+    armature.select_set(True)
+    bpy.context.view_layer.objects.active = armature
 
 
 def _arguments(argv: list[str]) -> argparse.Namespace:
@@ -96,6 +183,7 @@ def build(args: argparse.Namespace) -> Path:
         action_name="Policy_alpha_walking_forward",
         motion_kind="policy_rollout",
     )
+    _organize_release_scene(armature, args.policy_motion)
     manifest = bpy.data.texts.get("microduck-build-manifest.json") or bpy.data.texts.new(
         "microduck-build-manifest.json"
     )
@@ -103,15 +191,21 @@ def build(args: argparse.Namespace) -> Path:
     manifest.write(
         json.dumps(
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "robot_id": profile.robot_id,
                 "mouth_mode": (
                     "authorized-cad" if args.mouth_linkage is not None else "image-derived-approximation"
                 ),
-                "policy_motion_sha256": hashlib.sha256(
-                    args.policy_motion.read_bytes()
-                ).hexdigest(),
+                "motion_sha256": {
+                    "KinematicCrouchTest": hashlib.sha256(
+                        args.demo_motion.read_bytes()
+                    ).hexdigest(),
+                    "Policy_alpha_walking_forward": hashlib.sha256(
+                        args.policy_motion.read_bytes()
+                    ).hexdigest(),
+                },
                 "source_sha256": profile.source_sha256,
+                "build_blender_version": bpy.app.version_string,
             },
             indent=2,
             sort_keys=True,
@@ -119,6 +213,10 @@ def build(args: argparse.Namespace) -> Path:
     )
     output = args.output.expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
+    armature["fk_ik"] = 0.0
+    bpy.context.scene.frame_set(1)
+    bpy.context.view_layer.objects.active = armature
+    armature.select_set(True)
     bpy.ops.wm.save_as_mainfile(filepath=str(output), check_existing=False)
     return output
 
