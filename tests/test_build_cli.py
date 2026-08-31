@@ -268,6 +268,16 @@ class BuildCliTests(unittest.TestCase):
             self.assertEqual(armature.mode, "OBJECT")
             self.assertIs(bpy.context.view_layer.objects.active, armature)
             self.assertEqual(armature["fk_ik"], 0.0)
+            view_regions = [
+                area.spaces.active.region_3d
+                for screen in bpy.data.screens
+                for area in screen.areas
+                if area.type == "VIEW_3D"
+            ]
+            self.assertTrue(view_regions)
+            for region in view_regions:
+                self.assertLess(region.view_distance, 0.5)
+                self.assertAlmostEqual(region.view_location.z, 0.13, places=3)
             manifest = json.loads(
                 bpy.data.texts["microduck-build-manifest.json"].as_string()
             )

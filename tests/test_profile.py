@@ -120,7 +120,9 @@ class MouthLinkageTests(unittest.TestCase):
         self.assertEqual(linkage.closed_rad, math.radians(-5))
         self.assertEqual(linkage.open_rad, math.radians(30))
         self.assertEqual(linkage.samples[0].poses[linkage.links[0].name].position, (0.018, 0.0, -0.018))
-        self.assertLess(linkage.samples[-1].poses[linkage.links[0].name].quaternion_wxyz[1], 0.0)
+        open_quaternion = linkage.samples[-1].poses[linkage.links[0].name].quaternion_wxyz
+        self.assertAlmostEqual(open_quaternion[1], 0.0)
+        self.assertGreater(open_quaternion[2], 0.0)
         self.assertTrue(linkage.source_sha256)
     def test_rejects_linkage_without_validation_pose(self):
         payload = linkage_payload()
