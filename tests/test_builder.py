@@ -379,6 +379,19 @@ class SceneBuilderTests(unittest.TestCase):
         ).to_matrix().to_4x4()
         assert_matrix_almost_equal(self, actual, expected)
 
+    def test_normalizes_max_finite_builder_quaternion_without_overflow(self):
+        maximum = sys.float_info.max
+        actual = _transform(
+            (0.02, 0.03, 0.04),
+            (maximum, maximum, 0.0, 0.0),
+            field="maximum finite quaternion",
+        )
+        expected = Matrix.Translation((0.02, 0.03, 0.04))
+        expected @= Quaternion(
+            (0.7071067811865476, 0.7071067811865476, 0.0, 0.0)
+        ).to_matrix().to_4x4()
+        assert_matrix_almost_equal(self, actual, expected)
+
     @unittest.skipUnless(
         all(
             path.is_file()
