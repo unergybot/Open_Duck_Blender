@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 import struct
 import types
@@ -13,8 +14,26 @@ from .motion_import import import_motion_action
 from .profile import ProfileError, profile_to_json
 
 
-def _transform(position, quaternion) -> Matrix:
-    return Matrix.Translation(position) @ Quaternion(quaternion).to_matrix().to_4x4()
+def _transform(position, quaternion, *, field: str = "transform") -> Matrix:
+    try:
+        position = tuple(float(component) for component in position)
+    except (TypeError, ValueError) as exc:
+        raise ProfileError(f"{field} position must be three finite numbers") from exc
+    if len(position) != 3 or not all(math.isfinite(component) for component in position):
+        raise ProfileError(f"{field} position must be three finite numbers")
+    try:
+        quaternion = tuple(float(component) for component in quaternion)
+    except (TypeError, ValueError) as exc:
+        raise ProfileError(f"{field} quaternion must be four finite numbers") from exc
+    if len(quaternion) != 4 or not all(
+        math.isfinite(component) for component in quaternion
+    ):
+        raise ProfileError(f"{field} quaternion must be four finite numbers")
+    norm = math.sqrt(sum(component * component for component in quaternion))
+    if norm < 1e-12:
+        raise ProfileError(f"{field} quaternion cannot be zero")
+    normalized = tuple(component / norm for component in quaternion)
+    return Matrix.Translation(position) @ Quaternion(normalized).to_matrix().to_4x4()
 
 
 def _world_rest_matrices(profile) -> dict[str, Matrix]:
@@ -129,8 +148,8 @@ def _create_armature(profile, world_rest: dict[str, Matrix]):
     body_bones = {}
     for body in profile.bodies:
         bone = data.edit_bones.new(body.name)
-        bone.matrix = world_rest[body.name]
         bone.length = 0.015
+        bone.matrix = world_rest[body.name]
         if body.parent is not None:
             bone.parent = body_bones[body.parent]
             bone.use_connect = False
@@ -141,10 +160,12 @@ def _create_armature(profile, world_rest: dict[str, Matrix]):
             raise ProfileError(f"mouth link {link.name!r} has unknown parent {link.parent!r}")
         pose = profile.mouth.samples[0].poses[link.name]
         bone = data.edit_bones.new(f"mouth::{link.name}")
-        bone.matrix = world_rest[link.parent] @ _transform(
-            pose.position, pose.quaternion_wxyz
-        )
         bone.length = 0.01
+        bone.matrix = world_rest[link.parent] @ _transform(
+            pose.position,
+            pose.quaternion_wxyz,
+            field=f"mouth link {link.name}",
+        )
         bone.parent = parent
         bone.use_connect = False
     bpy.ops.object.mode_set(mode="POSE")
@@ -221,19 +242,25 @@ def _create_visuals(profile, mjcf_path: Path, armature, world_rest):
                 continue
             if mesh_name not in mesh_files:
                 raise ProfileError(f"MJCF geom references unknown mesh {mesh_name!r}")
-            if mesh_name not in mesh_data:
-                mesh_data[mesh_name] = _binary_stl(mesh_files[mesh_name], f"mesh::{mesh_name}")
+            material_name = geom.get("material")
+            material = materials.get(material_name)
+            mesh_key = (mesh_name, material_name)
+            if mesh_key not in mesh_data:
+                data_name = f"mesh::{mesh_name}"
+                if any(key[0] == mesh_name for key in mesh_data):
+                    data_name = f"{data_name}::{material_name or 'unmaterialed'}"
+                mesh_data[mesh_key] = _binary_stl(mesh_files[mesh_name], data_name)
+                if material is not None:
+                    mesh_data[mesh_key].materials.append(material)
             object_name = f"visual::{mesh_name}"
             if bpy.data.objects.get(object_name) is not None:
                 object_name = f"{object_name}::{name}::{index}"
-            obj = bpy.data.objects.new(object_name, mesh_data[mesh_name])
+            obj = bpy.data.objects.new(object_name, mesh_data[mesh_key])
             bpy.context.scene.collection.objects.link(obj)
-            material = materials.get(geom.get("material"))
-            if material is not None:
-                obj.data.materials.append(material)
             local = _transform(
                 tuple(float(value) for value in geom.get("pos", "0 0 0").split()),
                 tuple(float(value) for value in geom.get("quat", "1 0 0 0").split()),
+                field=f"visual geom {mesh_name}",
             )
             obj.matrix_world = body_world @ local
             bone_name = mouth_meshes.get(mesh_name, name)
@@ -242,9 +269,10 @@ def _create_visuals(profile, mjcf_path: Path, armature, world_rest):
             obj.parent = armature
             obj.parent_type = "BONE"
             obj.parent_bone = bone_name
-            obj.matrix_parent_inverse = (
-                armature.matrix_world @ armature.data.bones[bone_name].matrix_local
-            ).inverted_safe()
+            bone = armature.data.bones[bone_name]
+            bone_tail = armature.matrix_world @ bone.matrix_local
+            bone_tail.translation = armature.matrix_world @ bone.tail_local
+            obj.matrix_parent_inverse = bone_tail.inverted()
         for child in body_element.findall("body"):
             walk(child, body_world)
 
@@ -293,9 +321,9 @@ def generate_microduck_scene(
 
     addon.register()
     armature.duck_mouth_open = 0.0
-    armature.duck_colorway = "CREAM"
     _create_ik(profile, armature, world_rest)
     _create_visuals(profile, mjcf_path, armature, world_rest)
+    addon._apply_colorway(armature, "CREAM")
     _embed_addon(addon_source_root)
     if demo_motion_path is not None:
         import_motion_action(

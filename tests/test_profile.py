@@ -1,3 +1,4 @@
+import hashlib
 import json
 import math
 import tempfile
@@ -180,6 +181,45 @@ class ProfileBuildTests(unittest.TestCase):
             )
             restored = profile_from_json(profile_to_json(original))
         self.assertEqual(restored, original)
+
+    def test_hashes_each_referenced_stl_and_a_sorted_visual_asset_aggregate(self):
+        asset_mjcf = MJCF.replace(
+            "<worldbody>",
+            '<compiler meshdir="assets"/><asset>'
+            '<mesh name="part_b" file="part-b.stl"/>'
+            '<mesh name="part_a" file="part-a.stl"/>'
+            '</asset><worldbody>',
+        ).replace(
+            '<body name="trunk_base" pos="0 0 0.12">',
+            '<body name="trunk_base" pos="0 0 0.12">'
+            '<geom type="mesh" class="visual" mesh="part_b"/>'
+            '<geom type="mesh" class="visual" mesh="part_a"/>'
+            '<geom type="mesh" class="visual" mesh="part_b"/>',
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            assets = root / "assets"
+            assets.mkdir()
+            part_a = b"canonical-a"
+            part_b = b"canonical-b"
+            (assets / "part-a.stl").write_bytes(part_a)
+            (assets / "part-b.stl").write_bytes(part_b)
+            mjcf, runtime, mouth = self.write_sources(root)
+            mjcf.write_text(asset_mjcf)
+            profile = build_microduck_profile(
+                mjcf, runtime, mouth, expected_joint_count=3, expected_body_count=4
+            )
+
+        per_asset = {
+            "part-a.stl": hashlib.sha256(part_a).hexdigest(),
+            "part-b.stl": hashlib.sha256(part_b).hexdigest(),
+        }
+        aggregate = hashlib.sha256(
+            json.dumps(per_asset, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        self.assertEqual(profile.source_sha256["stl:part-a.stl"], per_asset["part-a.stl"])
+        self.assertEqual(profile.source_sha256["stl:part-b.stl"], per_asset["part-b.stl"])
+        self.assertEqual(profile.source_sha256["visual_assets"], aggregate)
 
 
 if __name__ == "__main__":

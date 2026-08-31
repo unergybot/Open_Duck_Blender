@@ -124,7 +124,6 @@ def _apply_colorway(armature: bpy.types.Object, key: str) -> None:
                 node = material.node_tree.nodes.get("Principled BSDF")
                 if node is not None:
                     node.inputs["Base Color"].default_value = colors[role]
-    armature["duck_colorway"] = key
 
 
 def _colorway_updated(self, _context):

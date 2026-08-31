@@ -448,6 +448,41 @@ def _mjcf_contract(path: Path) -> tuple[list[BodySpec], list[JointSpec]]:
     return bodies, joints
 
 
+def _visual_asset_hashes(path: Path) -> dict[str, str]:
+    root = ET.parse(path).getroot()
+    compiler = root.find("compiler")
+    mesh_dir = path.parent / (
+        compiler.get("meshdir", ".") if compiler is not None else "."
+    )
+    assets = {}
+    asset = root.find("asset")
+    if asset is not None:
+        for mesh in asset.findall("mesh"):
+            filename = mesh.get("file") or f"{mesh.get('name')}.stl"
+            assets[mesh.get("name") or Path(filename).stem] = filename
+    referenced = {
+        geom.get("mesh")
+        for geom in root.findall(".//geom")
+        if geom.get("mesh") and geom.get("class") in (None, "visual")
+    }
+    filenames = sorted({assets[name] for name in referenced if name in assets})
+    if not filenames:
+        return {}
+    per_asset = {
+        Path(filename).as_posix(): hashlib.sha256(
+            (mesh_dir / filename).read_bytes()
+        ).hexdigest()
+        for filename in filenames
+    }
+    aggregate = hashlib.sha256(
+        json.dumps(per_asset, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return {
+        **{f"stl:{filename}": digest for filename, digest in per_asset.items()},
+        "visual_assets": aggregate,
+    }
+
+
 def build_microduck_profile(
     mjcf_path: str | Path,
     runtime_model_path: str | Path,
@@ -495,6 +530,7 @@ def build_microduck_profile(
     }
     if contract is not None:
         hashes["joint_contract"] = hashlib.sha256(contract.read_bytes()).hexdigest()
+    hashes.update(_visual_asset_hashes(mjcf_path))
     return RobotProfile(
         1,
         "microduck-alpha",
