@@ -91,5 +91,91 @@ class MotionImportOperatorTests(unittest.TestCase):
         self.assertEqual({action.name for action in bpy.data.actions}, original_actions)
         self.assertEqual(tuple(prior.frame_range), original_action_range)
 
+
+class AnimationControlTests(unittest.TestCase):
+    def setUp(self):
+        bpy.ops.wm.read_factory_settings(use_empty=True)
+        addon.register()
+        self.profile = test_profile()
+        self.armature = build_minimal_rig(self.profile)
+        self.armature.data["duck_robot_profile_json"] = profile_to_json(self.profile)
+        self.walk = bpy.data.actions.new("Policy_alpha_walking_forward")
+        self.walk.use_frame_range = True
+        self.walk.frame_start = 1
+        self.walk.frame_end = 200
+        self.crouch = bpy.data.actions.new("MicroduckCrouchTest")
+        self.crouch.use_frame_range = True
+        self.crouch.frame_start = 1
+        self.crouch.frame_end = 51
+
+    def tearDown(self):
+        if bpy.context.screen.is_animation_playing:
+            bpy.ops.screen.animation_cancel(restore_frame=False)
+        addon.unregister()
+
+    def test_registers_beginner_animation_controls(self):
+        self.assertTrue(hasattr(bpy.types.Object, "duck_action_name"))
+        self.assertTrue(hasattr(bpy.types, "DUCK_OT_select_action"))
+        self.assertTrue(hasattr(bpy.types, "DUCK_OT_toggle_animation"))
+        self.assertTrue(hasattr(bpy.types, "DUCK_OT_reset_animation"))
+
+    def test_action_search_selection_activates_action_range_and_first_frame(self):
+        bpy.context.scene.frame_set(17)
+
+        self.armature.duck_action_name = self.walk.name
+
+        self.assertIs(self.armature.animation_data.action, self.walk)
+        self.assertEqual(self.armature.duck_action_name, self.walk.name)
+        self.assertEqual(
+            (bpy.context.scene.frame_start, bpy.context.scene.frame_end),
+            (1, 200),
+        )
+        self.assertEqual(bpy.context.scene.frame_current, 1)
+
+    def test_walk_and_crouch_presets_switch_actions(self):
+        self.armature.duck_action_name = self.walk.name
+
+        result = bpy.ops.duck.select_action(action_name=self.crouch.name)
+
+        self.assertEqual(result, {"FINISHED"})
+        self.assertIs(self.armature.animation_data.action, self.crouch)
+        self.assertEqual(
+            (
+                bpy.context.scene.frame_start,
+                bpy.context.scene.frame_end,
+                bpy.context.scene.frame_current,
+            ),
+            (1, 51, 1),
+        )
+
+    def test_missing_preset_cancels_without_changing_animation(self):
+        self.armature.duck_action_name = self.walk.name
+        bpy.context.scene.frame_set(25)
+
+        result = bpy.ops.duck.select_action(action_name="MissingAction")
+
+        self.assertEqual(result, {"CANCELLED"})
+        self.assertIs(self.armature.animation_data.action, self.walk)
+        self.assertEqual(
+            (
+                bpy.context.scene.frame_start,
+                bpy.context.scene.frame_end,
+                bpy.context.scene.frame_current,
+            ),
+            (1, 200, 25),
+        )
+
+    def test_play_pause_and_reset_controls_real_screen_playback(self):
+        self.armature.duck_action_name = self.walk.name
+
+        self.assertEqual(bpy.ops.duck.toggle_animation(), {"FINISHED"})
+        self.assertTrue(bpy.context.screen.is_animation_playing)
+        self.assertEqual(bpy.ops.duck.toggle_animation(), {"FINISHED"})
+        self.assertFalse(bpy.context.screen.is_animation_playing)
+        bpy.context.scene.frame_set(100)
+        self.assertEqual(bpy.ops.duck.reset_animation(), {"FINISHED"})
+        self.assertEqual(bpy.context.scene.frame_current, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

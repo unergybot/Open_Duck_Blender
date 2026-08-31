@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 import re
 
@@ -258,6 +259,85 @@ def _default_motion_action_name(filepath: str) -> str:
     return sanitized or "ImportedMotion"
 
 
+def _activate_action(armature, action, scene) -> None:
+    armature.animation_data_create()
+    armature.animation_data.action = action
+    start, end = action.frame_range
+    scene.frame_start = math.floor(start)
+    scene.frame_end = math.ceil(end)
+    scene.frame_set(scene.frame_start)
+
+
+def _action_name_get(armature) -> str:
+    animation_data = armature.animation_data
+    return animation_data.action.name if animation_data and animation_data.action else ""
+
+
+def _action_name_set(armature, action_name: str) -> None:
+    action = bpy.data.actions.get(action_name)
+    if action is not None:
+        _activate_action(armature, action, bpy.context.scene)
+
+
+class DUCK_OT_select_action(bpy.types.Operator):
+    bl_idname = "duck.select_action"
+    bl_label = "Select Duck Action"
+    bl_description = "Activate an animation and use its complete frame range"
+
+    action_name: bpy.props.StringProperty()
+
+    def execute(self, context):
+        armature = context.object
+        action = bpy.data.actions.get(self.action_name)
+        if armature is None or armature.type != "ARMATURE" or action is None:
+            self.report(
+                {"WARNING"},
+                f"Animation action is unavailable: {self.action_name}",
+            )
+            return {"CANCELLED"}
+        armature.duck_action_name = action.name
+        return {"FINISHED"}
+
+
+class DUCK_OT_toggle_animation(bpy.types.Operator):
+    bl_idname = "duck.toggle_animation"
+    bl_label = "Play/Pause"
+    bl_description = "Play or pause the active animation over its frame range"
+
+    def execute(self, context):
+        armature = context.object
+        if (
+            armature is None
+            or armature.animation_data is None
+            or armature.animation_data.action is None
+        ):
+            self.report({"WARNING"}, "Select an animation action first")
+            return {"CANCELLED"}
+        if context.screen.is_animation_playing:
+            bpy.ops.screen.animation_cancel(restore_frame=False)
+        else:
+            if not (
+                context.scene.frame_start
+                <= context.scene.frame_current
+                <= context.scene.frame_end
+            ):
+                context.scene.frame_set(context.scene.frame_start)
+            bpy.ops.screen.animation_play()
+        return {"FINISHED"}
+
+
+class DUCK_OT_reset_animation(bpy.types.Operator):
+    bl_idname = "duck.reset_animation"
+    bl_label = "Reset"
+    bl_description = "Pause and return to the first animation frame"
+
+    def execute(self, context):
+        if context.screen.is_animation_playing:
+            bpy.ops.screen.animation_cancel(restore_frame=False)
+        context.scene.frame_set(context.scene.frame_start)
+        return {"FINISHED"}
+
+
 class DUCK_OT_import_motion(bpy.types.Operator, ImportHelper):
     bl_idname = "duck.import_motion"
     bl_label = "Import mjlab Motion"
@@ -335,6 +415,41 @@ class DUCK_PT_tools(bpy.types.Panel):
         row = layout.row(align=True)
         row.operator("duck.switch_fk")
         row.operator("duck.switch_ik")
+        animation = layout.box()
+        animation.label(text="Animation", icon="ACTION")
+        animation.prop_search(
+            armature,
+            "duck_action_name",
+            bpy.data,
+            "actions",
+            text="Action",
+        )
+        presets = animation.row(align=True)
+        for action_name, label in (
+            ("Policy_alpha_walking_forward", "Walk"),
+            ("MicroduckCrouchTest", "Crouch"),
+        ):
+            if bpy.data.actions.get(action_name) is not None:
+                operator = presets.operator("duck.select_action", text=label)
+                operator.action_name = action_name
+        active_action = armature.animation_data and armature.animation_data.action
+        controls = animation.row(align=True)
+        controls.enabled = bool(active_action)
+        controls.operator(
+            "duck.toggle_animation",
+            text="Pause" if context.screen.is_animation_playing else "Play",
+            icon="PAUSE" if context.screen.is_animation_playing else "PLAY",
+        )
+        controls.operator("duck.reset_animation", text="Reset", icon="LOOP_BACK")
+        if active_action:
+            animation.label(
+                text=(
+                    f"Range {context.scene.frame_start}"
+                    f"–{context.scene.frame_end}"
+                )
+            )
+        else:
+            animation.label(text="No action selected", icon="INFO")
         layout.operator("duck.import_motion", icon="IMPORT")
         layout.operator("duck.export_motion", icon="EXPORT")
 
@@ -342,6 +457,9 @@ class DUCK_PT_tools(bpy.types.Panel):
 CLASSES = (
     DUCK_OT_switch_ik,
     DUCK_OT_switch_fk,
+    DUCK_OT_select_action,
+    DUCK_OT_toggle_animation,
+    DUCK_OT_reset_animation,
     DUCK_OT_import_motion,
     DUCK_OT_export_motion,
     DUCK_PT_tools,
@@ -367,9 +485,17 @@ def register():
             default=0.0,
             update=_mouth_updated,
         )
+    if not hasattr(bpy.types.Object, "duck_action_name"):
+        bpy.types.Object.duck_action_name = bpy.props.StringProperty(
+            name="Animation Action",
+            get=_action_name_get,
+            set=_action_name_set,
+        )
 
 
 def unregister():
+    if hasattr(bpy.types.Object, "duck_action_name"):
+        del bpy.types.Object.duck_action_name
     if hasattr(bpy.types.Object, "duck_mouth_open"):
         del bpy.types.Object.duck_mouth_open
     if hasattr(bpy.types.Object, "duck_colorway"):

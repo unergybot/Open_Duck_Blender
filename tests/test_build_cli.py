@@ -185,6 +185,10 @@ class BuildCliTests(unittest.TestCase):
                 bpy.data.objects["MicroduckRig"].animation_data.action.name,
                 "Policy_alpha_walking_forward",
             )
+            self.assertEqual(
+                bpy.data.objects["MicroduckRig"].duck_action_name,
+                "Policy_alpha_walking_forward",
+            )
             manifest = json.loads(
                 bpy.data.texts["microduck-build-manifest.json"].as_string()
             )
