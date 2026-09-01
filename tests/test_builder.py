@@ -442,6 +442,12 @@ class SceneBuilderTests(unittest.TestCase):
                 self, armature.data.bones[foot.name].matrix_local, expected
             )
             self.assertIn("duck_sagittal_pitch", foot)
+            pitch_ui = foot.id_properties_ui("duck_sagittal_pitch").as_dict()
+            self.assertEqual(pitch_ui["subtype"], "ANGLE")
+            self.assertAlmostEqual(pitch_ui["min"], -math.pi)
+            self.assertAlmostEqual(pitch_ui["max"], math.pi)
+            self.assertAlmostEqual(pitch_ui["soft_min"], -math.pi / 2.0)
+            self.assertAlmostEqual(pitch_ui["soft_max"], math.pi / 2.0)
 
         duck_constraints = [
             constraint

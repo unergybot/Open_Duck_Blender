@@ -254,6 +254,14 @@ def _create_armature(profile, world_rest: dict[str, Matrix]):
             foot.lock_rotation = (True, True, True)
             foot.lock_scale = (True, True, True)
             foot["duck_sagittal_pitch"] = 0.0
+            foot.id_properties_ui("duck_sagittal_pitch").update(
+                subtype="ANGLE",
+                min=-math.pi,
+                max=math.pi,
+                soft_min=-math.pi / 2.0,
+                soft_max=math.pi / 2.0,
+                description="Physical foot pitch around the sagittal axis",
+            )
         if pole is not None:
             pole.lock_rotation = (True, True, True)
             pole.lock_scale = (True, True, True)
