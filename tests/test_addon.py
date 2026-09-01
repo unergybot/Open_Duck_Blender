@@ -110,6 +110,80 @@ class RecordedLayout:
         )
 
 
+class BeginnerIKPanelTests(unittest.TestCase):
+    def setUp(self):
+        bpy.ops.wm.read_factory_settings(use_empty=True)
+        addon.register()
+        data = bpy.data.armatures.new("MicroduckIKPanel")
+        self.armature = bpy.data.objects.new("MicroduckIKPanel", data)
+        bpy.context.scene.collection.objects.link(self.armature)
+        self.armature["duck_robot_id"] = "microduck-alpha"
+        bpy.context.view_layer.objects.active = self.armature
+        self.armature.select_set(True)
+        bpy.ops.object.mode_set(mode="EDIT")
+        for side in ("left", "right"):
+            bone = data.edit_bones.new(f"IK_FOOT_{side}")
+            bone.head = (0.0, 0.0, 0.0)
+            bone.tail = (0.0, 0.0, 0.03)
+        bpy.ops.object.mode_set(mode="OBJECT")
+        for side in ("left", "right"):
+            foot = self.armature.pose.bones[f"IK_FOOT_{side}"]
+            foot["duck_sagittal_pitch"] = 0.0
+
+    def tearDown(self):
+        addon.unregister()
+
+    def draw_panel(self):
+        calls = []
+        addon.DUCK_PT_tools.draw(
+            SimpleNamespace(layout=RecordedLayout(calls)), bpy.context
+        )
+        return calls
+
+    def test_shows_discoverable_foot_pitch_sliders_only_in_ik_mode(self):
+        self.armature["fk_ik"] = 0.0
+        fk_calls = self.draw_panel()
+        self.assertFalse(
+            any(
+                call[0] == "prop"
+                and call[1]["property"] == '["duck_sagittal_pitch"]'
+                for call in fk_calls
+            )
+        )
+
+        self.armature["fk_ik"] = 1.0
+        ik_calls = self.draw_panel()
+        pitch_calls = [
+            call
+            for call in ik_calls
+            if call[0] == "prop"
+            and call[1]["property"] == '["duck_sagittal_pitch"]'
+        ]
+        self.assertEqual(
+            pitch_calls,
+            [
+                (
+                    "prop",
+                    {
+                        "property": '["duck_sagittal_pitch"]',
+                        "text": "Left Foot Pitch",
+                        "slider": True,
+                    },
+                    True,
+                ),
+                (
+                    "prop",
+                    {
+                        "property": '["duck_sagittal_pitch"]',
+                        "text": "Right Foot Pitch",
+                        "slider": True,
+                    },
+                    True,
+                ),
+            ],
+        )
+
+
 class PolicyPreviewPanelTests(unittest.TestCase):
     def setUp(self):
         bpy.ops.wm.read_factory_settings(use_empty=True)

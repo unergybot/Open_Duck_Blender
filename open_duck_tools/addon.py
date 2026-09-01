@@ -1042,6 +1042,23 @@ class DUCK_PT_tools(bpy.types.Panel):
         row = layout.row(align=True)
         row.operator("duck.switch_fk")
         row.operator("duck.switch_ik")
+        if (
+            armature.get("duck_robot_id") == "microduck-alpha"
+            and float(armature.get("fk_ik", 0.0)) >= 0.5
+        ):
+            foot_orientation = layout.box()
+            foot_orientation.label(
+                text="Foot Orientation", icon="ORIENTATION_GIMBAL"
+            )
+            for side, label in (("left", "Left"), ("right", "Right")):
+                foot = armature.pose.bones.get(f"IK_FOOT_{side}")
+                if foot is not None and "duck_sagittal_pitch" in foot:
+                    foot_orientation.prop(
+                        foot,
+                        '["duck_sagittal_pitch"]',
+                        text=f"{label} Foot Pitch",
+                        slider=True,
+                    )
         animation = layout.box()
         animation.label(text="Animation", icon="ACTION")
         animation.prop_search(

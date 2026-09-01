@@ -174,8 +174,12 @@ This writes `microduck-alpha.blend`. Open it with automatic Python execution
 allowed. The file opens at Walk frame 1 with the armature selected in Object
 Mode. Press `N` over the 3D View and choose the **Open Duck** tab; the panel
 shows the current FK/IK mode, animation controls, colourway, and the explicitly
-visual-only mouth approximation. Use **Open Duck → Export mjlab Motion** to
-export an action. Validate the result from the `microduck_rl` checkout:
+visual-only mouth approximation. Choose **Switch to IK** to move the foot
+controls. The panel then shows **Left Foot Pitch** and **Right Foot Pitch**
+angle sliders for tilting the feet within Microduck's physical sagittal-axis
+constraint; arbitrary three-axis foot rotation remains locked. Use **Open Duck
+→ Export mjlab Motion** to export an action. Validate the result from the
+`microduck_rl` checkout:
 
 ```bash
 cd ~/MyCode/microduck_rl
